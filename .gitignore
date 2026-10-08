@@ -1,5 +1,8 @@
 node_modules/
 .env
-src/uploads/
-*.log
 .expo/
+src/uploads/*
+!src/uploads/avatars/.gitkeep
+!src/uploads/hotels/.gitkeep
+*.log
+.DS_Store
