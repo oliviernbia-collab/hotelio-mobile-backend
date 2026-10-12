@@ -7,5 +7,6 @@ router.get('/',         authenticate, ctrl.show);
 router.put('/',         authenticate, ctrl.update);
 router.put('/password', authenticate, ctrl.changePassword);
 router.post('/avatar',  authenticate, avatarUpload.single('avatar'), ctrl.uploadAvatar);
+router.put('/payout',   authenticate, ctrl.updatePayout);
 
 module.exports = router;

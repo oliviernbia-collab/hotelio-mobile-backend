@@ -69,8 +69,35 @@ async function clearLogs(req, res) {
   res.json({ message: 'Logs effacés' });
 }
 
+async function getReviews(req, res) {
+  const { status, hotel_id } = req.query;
+  let sql = `SELECT r.*, u.name as user_name, h.name as hotel_name, h.short_name as hotel_short_name
+             FROM reviews r
+             JOIN users u ON r.user_id = u.id
+             JOIN hotels h ON r.hotel_id = h.id
+             WHERE 1=1`;
+  const params = [];
+  if (status) { sql += ' AND r.status = ?'; params.push(status); }
+  if (hotel_id) { sql += ' AND r.hotel_id = ?'; params.push(hotel_id); }
+  sql += ' ORDER BY r.created_at DESC';
+  const [rows] = await pool.query(sql, params);
+  res.json(rows);
+}
+
+async function recalcHotelRating(hotelId) {
+  const [[agg]] = await pool.query(
+    "SELECT AVG(rating) as avg_rating FROM reviews WHERE hotel_id = ? AND status = 'approved'",
+    [hotelId]
+  );
+  const rating = agg.avg_rating ? Math.round(Number(agg.avg_rating) * 10) / 10 : 4.5;
+  await pool.query('UPDATE hotels SET rating = ? WHERE id = ?', [rating, hotelId]);
+}
+
 async function approveReview(req, res) {
+  const [rows] = await pool.query('SELECT hotel_id FROM reviews WHERE id = ?', [req.params.id]);
+  if (!rows.length) return res.status(404).json({ message: 'Avis introuvable' });
   await pool.query("UPDATE reviews SET status = 'approved', updated_at = NOW() WHERE id = ?", [req.params.id]);
+  await recalcHotelRating(rows[0].hotel_id);
   res.json({ message: 'Avis approuvé' });
 }
 
@@ -79,4 +106,4 @@ async function rejectReview(req, res) {
   res.json({ message: 'Avis rejeté' });
 }
 
-module.exports = { getUsers, createUser, updateUser, deleteUser, getLogs, clearLogs, approveReview, rejectReview };
+module.exports = { getUsers, createUser, updateUser, deleteUser, getLogs, clearLogs, getReviews, approveReview, rejectReview };

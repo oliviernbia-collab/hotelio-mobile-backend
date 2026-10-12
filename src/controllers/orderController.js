@@ -9,7 +9,17 @@ async function index(req, res) {
              LEFT JOIN clients c ON o.client_id = c.id
              WHERE 1=1`;
   const params = [];
-  if (hotel_id) { sql += ' AND o.hotel_id = ?'; params.push(hotel_id); }
+
+  if (req.user.role === 'employe') {
+    if (!req.user.hotel_id) return res.json([]);
+    sql += ' AND o.hotel_id = ?'; params.push(req.user.hotel_id);
+  } else if (req.user.role === 'prestataire') {
+    sql += ' AND o.hotel_id IN (SELECT id FROM hotels WHERE user_id = ?)'; params.push(req.user.id);
+    if (hotel_id) { sql += ' AND o.hotel_id = ?'; params.push(hotel_id); }
+  } else if (hotel_id) {
+    sql += ' AND o.hotel_id = ?'; params.push(hotel_id);
+  }
+
   if (status) { sql += ' AND o.status = ?'; params.push(status); }
   if (client_id) { sql += ' AND o.client_id = ?'; params.push(client_id); }
   sql += ' ORDER BY o.created_at DESC';
@@ -20,6 +30,9 @@ async function index(req, res) {
 async function store(req, res) {
   const { hotel_id, client_id, menu_item_id, quantity, notes } = req.body;
   if (!hotel_id || !menu_item_id) return res.status(422).json({ message: 'hotel_id et menu_item_id requis' });
+  if (!(await canManageHotel(req.user, hotel_id))) {
+    return res.status(403).json({ message: 'Accès refusé à cet hôtel.' });
+  }
   const [item] = await pool.query('SELECT * FROM menu_items WHERE id = ?', [menu_item_id]);
   if (!item.length) return res.status(404).json({ message: 'Article de menu introuvable' });
   if (!item[0].available) return res.status(422).json({ message: 'Article non disponible' });

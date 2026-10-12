@@ -1,5 +1,6 @@
 const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
+const jeko = require('../services/jeko');
 
 const APP_URL = process.env.APP_URL || 'http://localhost:3000';
 
@@ -18,7 +19,7 @@ function mapUser(row) {
 
 async function show(req, res) {
   const [rows] = await pool.query(
-    'SELECT id, name, email, role, status, hotels, permissions, two_fa_enabled, avatar, created_at FROM users WHERE id = ?',
+    'SELECT id, name, email, role, status, hotels, permissions, two_fa_enabled, payout_method, payout_identifier, jeko_contact_id, avatar, created_at FROM users WHERE id = ?',
     [req.user.id]
   );
   const user = mapUser(rows[0]);
@@ -57,7 +58,7 @@ async function update(req, res) {
   params.push(req.user.id);
   await pool.query(`UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = ?`, params);
   const [updated] = await pool.query(
-    'SELECT id, name, email, role, status, hotels, permissions, two_fa_enabled, avatar FROM users WHERE id = ?',
+    'SELECT id, name, email, role, status, hotels, permissions, two_fa_enabled, payout_method, payout_identifier, jeko_contact_id, avatar FROM users WHERE id = ?',
     [req.user.id]
   );
   res.json({ message: 'Profil mis à jour', user: mapUser(updated[0]) });
@@ -79,10 +80,53 @@ async function uploadAvatar(req, res) {
   if (!req.file) return res.status(422).json({ message: 'Fichier image requis' });
   await pool.query('UPDATE users SET avatar = ?, updated_at = NOW() WHERE id = ?', [req.file.path, req.user.id]);
   const [rows] = await pool.query(
-    'SELECT id, name, email, role, status, hotels, permissions, two_fa_enabled, avatar FROM users WHERE id = ?',
+    'SELECT id, name, email, role, status, hotels, permissions, two_fa_enabled, payout_method, payout_identifier, jeko_contact_id, avatar FROM users WHERE id = ?',
     [req.user.id]
   );
   res.json({ message: 'Avatar mis à jour', user: mapUser(rows[0]) });
 }
 
-module.exports = { show, update, changePassword, uploadAvatar };
+// Enregistre les coordonnées de paiement du prestataire (mobile money ou RIB bancaire)
+// pour les reversements automatiques, et crée le contact bénéficiaire correspondant chez Jèko.
+async function updatePayout(req, res) {
+  const { payout_method, phone_number, bank_name, bank_code, swift_code, agency_code, account_number, rib_key } = req.body;
+
+  const validMethods = ['wave', 'orange_money', 'mtn', 'moov', 'djamo', 'bank'];
+  if (!validMethods.includes(payout_method)) {
+    return res.status(422).json({ message: 'Méthode de paiement invalide' });
+  }
+
+  const isBank = payout_method === 'bank';
+  if (isBank && (!bank_name || !bank_code || !swift_code || !agency_code || !account_number || !rib_key)) {
+    return res.status(422).json({ message: 'Tous les champs bancaires sont requis' });
+  }
+  if (!isBank && !phone_number) {
+    return res.status(422).json({ message: 'Numéro de téléphone requis' });
+  }
+
+  const identifier = isBank
+    ? { bankName: bank_name, bankCode: bank_code, swiftCode: swift_code, agencyCode: agency_code, accountNumber: account_number, key: rib_key }
+    : { number: phone_number };
+
+  const [userRows] = await pool.query('SELECT name, jeko_contact_id FROM users WHERE id = ?', [req.user.id]);
+  const user = userRows[0];
+
+  const result = await jeko.createContact({ name: user.name, paymentMethod: payout_method, identifier });
+
+  if (!result || !result.id) {
+    return res.status(422).json({ message: (result && result.message) || "Impossible d'enregistrer ces coordonnées de paiement pour le moment." });
+  }
+
+  await pool.query(
+    'UPDATE users SET payout_method = ?, payout_identifier = ?, jeko_contact_id = ?, updated_at = NOW() WHERE id = ?',
+    [payout_method, JSON.stringify(identifier), result.id, req.user.id]
+  );
+
+  if (user.jeko_contact_id) {
+    jeko.deleteContact(user.jeko_contact_id).catch(() => {});
+  }
+
+  res.json({ message: 'Coordonnées de paiement enregistrées' });
+}
+
+module.exports = { show, update, changePassword, uploadAvatar, updatePayout };

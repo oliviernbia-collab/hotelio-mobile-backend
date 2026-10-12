@@ -1,6 +1,7 @@
 const { pool } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
 const jeko = require('../services/jeko');
+const { canManageHotel } = require('../utils/authorize');
 
 /* Notification in-app (lue aussi bien par le web que par le mobile, même table `notifications`) */
 async function notifyUser(userId, type, title, message, extra = {}) {
@@ -19,7 +20,36 @@ async function notifyUser(userId, type, title, message, extra = {}) {
 /* Confirme le paiement effectif d'une réservation : statut + stats client/hôtel.
    N'est appelé ici que pour Espèces/Virement (confirmation immédiate, pas de passerelle) ;
    pour un paiement Jèko, c'est le webhook (partagé avec le web, même base) qui s'en charge. */
+const COMMISSIONABLE_CHANNELS = ['Site web', 'App mobile'];
+const DEFAULT_COMMISSION_RATE = 10.00;
+
+async function computeCommission(reservation) {
+  if (!COMMISSIONABLE_CHANNELS.includes(reservation.channel)) return null;
+
+  const [[hotel]] = await pool.query('SELECT user_id FROM hotels WHERE id = ?', [reservation.hotel_id]);
+  if (!hotel || !hotel.user_id) return null;
+
+  const [[sub]] = await pool.query(
+    `SELECT p.commission_rate FROM subscriptions s
+     JOIN subscription_plans p ON s.subscription_plan_id = p.id
+     WHERE s.user_id = ? AND s.status = 'active'
+     ORDER BY s.created_at DESC LIMIT 1`,
+    [hotel.user_id]
+  );
+  const rate = sub ? Number(sub.commission_rate) : DEFAULT_COMMISSION_RATE;
+  const amount = Math.round(Number(reservation.total) * rate / 100);
+  return { rate, amount };
+}
+
 async function markReservationPaid(reservation) {
+  const commission = await computeCommission(reservation);
+  if (commission) {
+    await pool.query(
+      'UPDATE reservations SET commission_rate = ?, commission_amount = ? WHERE id = ?',
+      [commission.rate, commission.amount, reservation.id]
+    );
+  }
+
   await pool.query(
     "UPDATE reservations SET paid = 1, status = 'confirmée', updated_at = NOW() WHERE id = ?",
     [reservation.id]
@@ -220,12 +250,56 @@ async function mine(req, res) {
   res.json(rows);
 }
 
+// Vérifie que l'utilisateur a le droit de changer le statut de CETTE réservation précise.
+// Un client ne peut qu'annuler sa propre réservation ; le staff est limité à son périmètre d'hôtel.
+async function canUpdateReservationStatus(user, reservation, newStatus) {
+  if (user.role === 'admin') return true;
+  if (user.role === 'prestataire') return canManageHotel(user, reservation.hotel_id);
+  if (user.role === 'employe') return Number(user.hotel_id) === Number(reservation.hotel_id);
+  if (user.role === 'client') return reservation.client_user_id === user.id && newStatus === 'annulée';
+  return false;
+}
+
+// Annule les effets comptables de markReservationPaid() quand une réservation payée est annulée :
+// la commission déjà calculée est remise à zéro et les statistiques (hôtel, client) sont décrémentées.
+// Le paiement lui-même (`paid`) n'est pas touché — un éventuel remboursement reste géré manuellement.
+async function reverseCommissionAndStats(reservation) {
+  await pool.query(
+    'UPDATE hotels SET revenue = GREATEST(revenue - ?, 0), checkins = GREATEST(checkins - 1, 0) WHERE id = ?',
+    [reservation.total, reservation.hotel_id]
+  );
+  await pool.query(
+    'UPDATE clients SET total_spend = GREATEST(total_spend - ?, 0), total_stays = GREATEST(total_stays - 1, 0) WHERE id = ?',
+    [reservation.total, reservation.client_id]
+  );
+  await pool.query(
+    'UPDATE reservations SET commission_rate = NULL, commission_amount = NULL WHERE id = ?',
+    [reservation.id]
+  );
+}
+
 async function updateStatus(req, res) {
   const { status } = req.body;
   const valid = ['confirmée', 'en_attente', 'annulée', 'complétée'];
   if (!valid.includes(status)) return res.status(422).json({ message: 'Statut invalide' });
-  const [rows] = await pool.query('SELECT * FROM reservations WHERE id = ?', [req.params.id]);
+
+  const [rows] = await pool.query(
+    `SELECT res.*, c.user_id AS client_user_id
+     FROM reservations res JOIN clients c ON res.client_id = c.id
+     WHERE res.id = ?`,
+    [req.params.id]
+  );
   if (!rows.length) return res.status(404).json({ message: 'Réservation introuvable' });
+  const reservation = rows[0];
+
+  if (!(await canUpdateReservationStatus(req.user, reservation, status))) {
+    return res.status(403).json({ message: 'Accès refusé à cette réservation.' });
+  }
+
+  if (status === 'annulée' && reservation.status !== 'annulée' && reservation.paid) {
+    await reverseCommissionAndStats(reservation);
+  }
+
   await pool.query('UPDATE reservations SET status = ?, updated_at = NOW() WHERE id = ?', [status, req.params.id]);
   res.json({ message: 'Statut mis à jour', status });
 }

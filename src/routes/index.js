@@ -20,5 +20,6 @@ router.use('/favorites', require('./favorites'));
 router.use('/admin', require('./admin'));
 router.use('/services', require('./services'));
 router.use('/pointage', require('./pointage'));
+router.use('/subscriptions', require('./subscriptions'));
 
 module.exports = router;

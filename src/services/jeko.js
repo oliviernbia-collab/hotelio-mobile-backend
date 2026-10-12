@@ -39,4 +39,28 @@ async function getPaymentRequest(id) {
   return res.json();
 }
 
-module.exports = { mapPaymentMethod, createPaymentRequest, getPaymentRequest };
+// Crée un contact bénéficiaire (mobile money ou bancaire) pour les virements sortants.
+async function createContact(data) {
+  const res = await fetch(`${JEKO_BASE_URL}/partner_api/contacts`, {
+    method: 'POST',
+    headers: {
+      'X-API-KEY': process.env.JEKO_API_KEY,
+      'X-API-KEY-ID': process.env.JEKO_API_KEY_ID,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(data),
+  });
+  return res.json();
+}
+
+async function deleteContact(contactId) {
+  await fetch(`${JEKO_BASE_URL}/partner_api/contacts/${contactId}`, {
+    method: 'DELETE',
+    headers: {
+      'X-API-KEY': process.env.JEKO_API_KEY,
+      'X-API-KEY-ID': process.env.JEKO_API_KEY_ID,
+    },
+  }).catch(() => {});
+}
+
+module.exports = { mapPaymentMethod, createPaymentRequest, getPaymentRequest, createContact, deleteContact };

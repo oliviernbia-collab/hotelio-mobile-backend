@@ -70,6 +70,22 @@ async function store(req, res) {
   if (req.user.role !== 'admin' && req.user.role !== 'prestataire') {
     return res.status(403).json({ message: "Vous n'avez pas le droit de créer un hôtel." });
   }
+
+  if (req.user.role === 'prestataire') {
+    const [[limit]] = await pool.query(
+      `SELECT p.max_hotels FROM subscriptions s
+       JOIN subscription_plans p ON s.subscription_plan_id = p.id
+       WHERE s.user_id = ? ORDER BY s.created_at DESC LIMIT 1`,
+      [req.user.id]
+    );
+    if (limit && limit.max_hotels !== null) {
+      const [[{ total }]] = await pool.query('SELECT COUNT(*) as total FROM hotels WHERE user_id = ?', [req.user.id]);
+      if (total >= limit.max_hotels) {
+        return res.status(422).json({ message: "Quota d'hôtels atteint pour votre palier d'abonnement — passez à un palier supérieur." });
+      }
+    }
+  }
+
   const { name, short_name, city, commune, quartier, stars, rooms, category, price, description, services, manager, phone, email } = req.body;
   if (!name || !city) return res.status(422).json({ message: 'Nom et ville requis' });
 

@@ -1,6 +1,7 @@
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const express = require('express');
+require('express-async-errors'); // patche express pour transmettre les rejets de promesses à errorHandler au lieu de planter le process
 const cors = require('cors');
 const { testConnection } = require('./src/config/database');
 const routes = require('./src/routes/index');
@@ -59,6 +60,16 @@ app.use('/api', routes);
 
 app.use((req, res) => res.status(404).json({ message: 'Route introuvable' }));
 app.use(errorHandler);
+
+// Filet de sécurité pour les erreurs survenant hors du cycle requête/réponse
+// (ex. tâche de fond, timer). Les erreurs des routes sont déjà gérées par
+// express-async-errors + errorHandler et ne devraient jamais arriver ici.
+process.on('unhandledRejection', (err) => {
+  console.error('❌ Promesse rejetée non gérée:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ Exception non interceptée:', err);
+});
 
 async function bootstrap() {
   await testConnection();

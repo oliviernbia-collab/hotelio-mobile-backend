@@ -10,6 +10,12 @@ function generateToken(user) {
   );
 }
 
+// Retire les champs sensibles et normalise two_fa_enabled -> two_fa (booléen) pour le client mobile
+function sanitizeUser(user) {
+  const { password, two_fa_secret, two_fa_enabled, ...rest } = user;
+  return { ...rest, two_fa: !!two_fa_enabled };
+}
+
 async function login(req, res) {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -27,17 +33,19 @@ async function login(req, res) {
   if (user.status !== 'actif') {
     return res.status(403).json({ message: 'Compte inactif' });
   }
+  if (user.two_fa_enabled) {
+    return res.json({ requires_2fa: true, user_id: user.id });
+  }
   await pool.query(
     "INSERT INTO activity_logs (user_id, user_name, user_role, action, description, ip_address) VALUES (?, ?, ?, 'login', ?, ?)",
     [user.id, user.name, user.role, `Connexion de ${user.name}`, req.ip]
   );
   const token = generateToken(user);
-  const { password: _, ...userSafe } = user;
-  res.json({ token, user: withAvatarUrl(userSafe) });
+  res.json({ token, user: withAvatarUrl(sanitizeUser(user)) });
 }
 
 async function register(req, res) {
-  const { name, email, password, role = 'client' } = req.body;
+  const { name, email, password, role = 'client', plan } = req.body;
 
   if (!name || !email || !password) {
     return res.status(422).json({ message: 'Nom, email et mot de passe requis' });
@@ -51,9 +59,13 @@ async function register(req, res) {
     return res.status(422).json({ message: 'Email déjà utilisé' });
   }
 
-  // Pour un propriétaire (prestataire), un document de preuve est obligatoire
+  // Pour un propriétaire (prestataire), un document de preuve et un palier d'abonnement sont obligatoires
   if (finalRole === 'prestataire' && !req.file) {
     return res.status(422).json({ message: 'Un justificatif de propriété est requis.' });
+  }
+  const validPlans = ['starter', 'business', 'premium'];
+  if (finalRole === 'prestataire' && !validPlans.includes(plan)) {
+    return res.status(422).json({ message: 'Un palier d’abonnement valide est requis.' });
   }
 
   const hashed = await bcrypt.hash(password, 12);
@@ -77,6 +89,14 @@ async function register(req, res) {
   );
 
   if (finalRole === 'prestataire') {
+    const [planRows] = await pool.query('SELECT id FROM subscription_plans WHERE slug = ?', [plan]);
+    if (planRows.length) {
+      await pool.query(
+        "INSERT INTO subscriptions (user_id, subscription_plan_id, status, created_at, updated_at) VALUES (?, ?, 'pending_payment', NOW(), NOW())",
+        [result.insertId, planRows[0].id]
+      );
+    }
+
     // Notifier les admins (log d'activité)
     await pool.query(
       "INSERT INTO activity_logs (user_name, user_role, action, description) VALUES (?, ?, 'created', ?)",
@@ -106,7 +126,7 @@ async function me(req, res) {
     'SELECT id, name, email, role, status, hotels, permissions, two_fa_enabled, avatar, created_at FROM users WHERE id = ?',
     [req.user.id]
   );
-  res.json(withAvatarUrl(rows[0]));
+  res.json(withAvatarUrl(sanitizeUser(rows[0])));
 }
 
 async function logout(req, res) {
@@ -123,4 +143,4 @@ async function forgotPassword(req, res) {
   res.json({ message: "Si cet email existe, un lien de réinitialisation a été envoyé." });
 }
 
-module.exports = { login, register, me, logout, forgotPassword };
+module.exports = { login, register, me, logout, forgotPassword, generateToken, withAvatarUrl, sanitizeUser };
