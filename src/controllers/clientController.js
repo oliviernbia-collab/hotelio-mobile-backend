@@ -1,5 +1,30 @@
 const { pool } = require('../config/database');
 
+// Un client n'a pas de hotel_id direct : le rattachement se fait via ses réservations
+// (même logique que index()/topClients() — un prestataire/employé ne voit que les
+// clients ayant séjourné dans l'un de ses hôtels).
+async function canAccessClient(user, clientId) {
+  if (user.role === 'admin') return true;
+
+  let sql = `SELECT 1 FROM reservations res JOIN hotels h ON h.id = res.hotel_id WHERE res.client_id = ?`;
+  const params = [clientId];
+
+  if (user.role === 'prestataire') {
+    sql += ' AND h.user_id = ?';
+    params.push(user.id);
+  } else if (user.role === 'employe') {
+    if (!user.hotel_id) return false;
+    sql += ' AND h.id = ?';
+    params.push(user.hotel_id);
+  } else {
+    return false;
+  }
+
+  sql += ' LIMIT 1';
+  const [rows] = await pool.query(sql, params);
+  return rows.length > 0;
+}
+
 async function index(req, res) {
   const { search, status, city } = req.query;
   let sql = `
@@ -34,6 +59,9 @@ async function show(req, res) {
     WHERE c.id = ?
     GROUP BY c.id`, [req.params.id]);
   if (!rows.length) return res.status(404).json({ message: 'Client introuvable' });
+  if (!(await canAccessClient(req.user, req.params.id))) {
+    return res.status(403).json({ message: 'Accès refusé à ce client.' });
+  }
   const [reservations] = await pool.query(
     `SELECT res.*, h.name AS hotel_name, h.short_name AS hotel_short_name,
             r.number AS room_number, r.type AS room_type, r.price AS room_price
@@ -62,6 +90,9 @@ async function store(req, res) {
 async function update(req, res) {
   const [rows] = await pool.query('SELECT id FROM clients WHERE id = ?', [req.params.id]);
   if (!rows.length) return res.status(404).json({ message: 'Client introuvable' });
+  if (!(await canAccessClient(req.user, req.params.id))) {
+    return res.status(403).json({ message: 'Accès refusé à ce client.' });
+  }
   const fields = ['first_name', 'last_name', 'email', 'phone', 'city', 'quartier', 'nationality', 'note', 'status'];
   const updates = [];
   const params = [];
@@ -78,6 +109,9 @@ async function update(req, res) {
 async function destroy(req, res) {
   const [rows] = await pool.query('SELECT id FROM clients WHERE id = ?', [req.params.id]);
   if (!rows.length) return res.status(404).json({ message: 'Client introuvable' });
+  if (!(await canAccessClient(req.user, req.params.id))) {
+    return res.status(403).json({ message: 'Accès refusé à ce client.' });
+  }
   await pool.query('DELETE FROM clients WHERE id = ?', [req.params.id]);
   res.json({ message: 'Client supprimé' });
 }
@@ -119,6 +153,9 @@ async function addPoints(req, res) {
 
   const [rows] = await pool.query('SELECT * FROM clients WHERE id = ?', [req.params.id]);
   if (!rows.length) return res.status(404).json({ message: 'Client introuvable' });
+  if (!(await canAccessClient(req.user, req.params.id))) {
+    return res.status(403).json({ message: 'Accès refusé à ce client.' });
+  }
 
   const newTotal = Math.max(0, (rows[0].points_fidelite || 0) + Number(points));
   await pool.query(

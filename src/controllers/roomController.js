@@ -1,8 +1,18 @@
 const { pool } = require('../config/database');
 const { canManageHotel } = require('../utils/authorize');
 
+const APP_URL = process.env.APP_URL || 'http://localhost:3001';
+
 // Ajout de la colonne vue si elle n'existe pas encore
 pool.query("ALTER TABLE rooms ADD COLUMN vue VARCHAR(150) NULL").catch(() => {});
+
+function parseRoom(r) {
+  let image_url = null;
+  if (r.image) {
+    image_url = r.image.startsWith('http') ? r.image : `${APP_URL}/storage/${r.image}`;
+  }
+  return { ...r, image_url };
+}
 
 async function index(req, res) {
   const { hotel_id, status, type, floor } = req.query;
@@ -19,7 +29,7 @@ async function index(req, res) {
   if (floor) { sql += ' AND r.floor = ?'; params.push(parseInt(floor)); }
   sql += ' ORDER BY r.floor, r.number';
   const [rows] = await pool.query(sql, params);
-  res.json(rows);
+  res.json(rows.map(parseRoom));
 }
 
 async function show(req, res) {
@@ -28,7 +38,7 @@ async function show(req, res) {
     [req.params.id]
   );
   if (!rows.length) return res.status(404).json({ message: 'Chambre introuvable' });
-  res.json(rows[0]);
+  res.json(parseRoom(rows[0]));
 }
 
 async function store(req, res) {
@@ -39,12 +49,13 @@ async function store(req, res) {
   }
   const [exist] = await pool.query('SELECT id FROM rooms WHERE hotel_id = ? AND number = ?', [hotel_id, number]);
   if (exist.length) return res.status(422).json({ message: 'Ce numéro de chambre existe déjà' });
+  const imagePath = req.file ? req.file.path : null;
   const [result] = await pool.query(
-    'INSERT INTO rooms (hotel_id, number, floor, type, price, capacity, superficie_m2, description, vue, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [hotel_id, number, floor || 1, type || 'Standard', price || 0, capacity || 2, superficie_m2, description, vue, 'disponible']
+    'INSERT INTO rooms (hotel_id, number, floor, type, price, capacity, superficie_m2, description, vue, image, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [hotel_id, number, floor || 1, type || 'Standard', price || 0, capacity || 2, superficie_m2, description, vue, imagePath, 'disponible']
   );
   const [newRoom] = await pool.query('SELECT * FROM rooms WHERE id = ?', [result.insertId]);
-  res.status(201).json(newRoom[0]);
+  res.status(201).json(parseRoom(newRoom[0]));
 }
 
 async function update(req, res) {
@@ -59,11 +70,15 @@ async function update(req, res) {
   fields.forEach(f => {
     if (req.body[f] !== undefined) { updates.push(`${f} = ?`); params.push(req.body[f]); }
   });
+  if (req.file) {
+    updates.push('image = ?');
+    params.push(req.file.path);
+  }
   if (!updates.length) return res.status(422).json({ message: 'Aucune donnée' });
   params.push(req.params.id);
   await pool.query(`UPDATE rooms SET ${updates.join(', ')}, updated_at = NOW() WHERE id = ?`, params);
   const [updated] = await pool.query('SELECT * FROM rooms WHERE id = ?', [req.params.id]);
-  res.json(updated[0]);
+  res.json(parseRoom(updated[0]));
 }
 
 async function updateStatus(req, res) {
@@ -109,7 +124,7 @@ async function mine(req, res) {
   if (status) { sql += ' AND r.status = ?'; params.push(status); }
   sql += ' ORDER BY h.name, r.floor, r.number';
   const [rows] = await pool.query(sql, params);
-  res.json(rows);
+  res.json(rows.map(parseRoom));
 }
 
 module.exports = { index, mine, show, store, update, updateStatus, markCleaned, destroy };

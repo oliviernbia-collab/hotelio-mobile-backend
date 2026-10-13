@@ -38,21 +38,58 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(path.join(__dirname, 'src/uploads')));
-// Servir les images stockées par Laravel
-app.use('/storage', express.static(path.join(__dirname, '../../public/storage')));
+// Servir les images stockées par Laravel (webPHP/public/storage, depuis la réorganisation en monorepo)
+app.use('/storage', express.static(path.join(__dirname, '../webPHP/public/storage')));
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'Hôtelio Mobile API', version: '1.0.0' }));
 
 // Page-relais pour successUrl/errorUrl Jèko : l'utilisateur revient ici depuis le
-// navigateur système après son paiement, puis rouvre l'app manuellement (le statut
-// réel est confirmé par le webhook, pas par cette redirection).
-app.get('/payment/bridge', (req, res) => {
+// navigateur système après son paiement. La confirmation définitive vient normalement
+// du webhook Jèko (voir JekoWebhookController@handle côté web) — mais celui-ci ne peut
+// pas nous joindre si ce serveur n'est pas accessible publiquement (ex. développement
+// local). En filet de sécurité, on demande donc ici au backend web de revérifier
+// directement auprès de Jèko et de confirmer le paiement si le webhook n'est pas
+// encore arrivé (voir JekoWebhookController::syncPayment).
+const WEBPHP_URL = process.env.WEBPHP_URL || 'http://localhost:8000';
+
+app.get('/payment/bridge', async (req, res) => {
   const ok = req.query.result !== 'error';
+  let synced = null;
+
+  if (ok && req.query.ref && process.env.JEKO_INTERNAL_SYNC_KEY) {
+    try {
+      const syncRes = await fetch(`${WEBPHP_URL}/api/internal/jeko/sync-payment`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Internal-Key': process.env.JEKO_INTERNAL_SYNC_KEY,
+        },
+        body: JSON.stringify({ reference: req.query.ref }),
+      });
+      const data = await syncRes.json();
+      synced = !!data.synced;
+    } catch (e) {
+      console.error('⚠️  /payment/bridge : échec de la vérification de secours auprès de Jèko:', e.message);
+    }
+  }
+
+  const title = !ok
+    ? '⚠️ Paiement annulé ou échoué'
+    : synced === false
+      ? '⏳ Paiement en cours de confirmation'
+      : '✅ Paiement terminé';
+
+  const message = !ok
+    ? "Vous pouvez maintenant revenir sur l'application Hôtelio."
+    : synced === false
+      ? "Le paiement est en cours de vérification — ça ne devrait prendre que quelques instants. Revenez sur l'application et actualisez dans un moment."
+      : "Vous pouvez maintenant revenir sur l'application Hôtelio.";
+
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Hôtelio</title></head>
     <body style="font-family:sans-serif;text-align:center;padding:48px 20px;background:#F8F9FA;color:#2C3E50;">
-      <h2>${ok ? '✅ Paiement terminé' : '⚠️ Paiement annulé ou échoué'}</h2>
-      <p>Vous pouvez maintenant revenir sur l'application Hôtelio.</p>
+      <h2>${title}</h2>
+      <p>${message}</p>
     </body></html>`);
 });
 

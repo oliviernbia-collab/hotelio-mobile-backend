@@ -21,7 +21,7 @@ const { canManageHotel } = require('../utils/authorize');
 let LOGO_B64 = '';
 try {
   LOGO_B64 = fs.readFileSync(
-    path.join(__dirname, '..', '..', '..', 'assets', 'logo.png')
+    path.join(__dirname, '..', '..', '..', 'mobile', 'assets', 'logo.png')
   ).toString('base64');
 } catch {}
 const LOGO_SRC = LOGO_B64 ? `data:image/png;base64,${LOGO_B64}` : '';
@@ -119,6 +119,9 @@ async function show(req, res) {
     [req.params.id]
   );
   if (!rows.length) return res.status(404).json({ message: 'Facturation introuvable' });
+  if (!(await canManageHotel(req.user, rows[0].hotel_id))) {
+    return res.status(403).json({ message: 'Accès refusé à cette facturation.' });
+  }
   res.json(rows[0]);
 }
 
@@ -139,7 +142,12 @@ async function store(req, res) {
     ? Number(hotel_id)
     : (req.user.role === 'employe' ? (req.user.hotel_id ?? null) : null);
 
-  if (resolvedHotelId && !(await canManageHotel(req.user, resolvedHotelId))) {
+  // hotel_id obligatoire : sans lui, impossible d'isoler cette facturation par hôtel/prestataire
+  // (voir index()/show()/update()/pay()/destroy() qui s'appuient tous dessus).
+  if (!resolvedHotelId) {
+    return res.status(422).json({ message: 'hotel_id requis' });
+  }
+  if (!(await canManageHotel(req.user, resolvedHotelId))) {
     return res.status(403).json({ message: 'Accès refusé à cet hôtel.' });
   }
 
@@ -197,6 +205,9 @@ async function update(req, res) {
   const prev = existing[0];
   if (!(await canManageHotel(req.user, prev.hotel_id))) {
     return res.status(403).json({ message: 'Accès refusé à cette facturation.' });
+  }
+  if (req.body.hotel_id !== undefined && !(await canManageHotel(req.user, req.body.hotel_id))) {
+    return res.status(403).json({ message: 'Accès refusé à cet hôtel.' });
   }
 
   const allowed = [

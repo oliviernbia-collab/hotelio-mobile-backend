@@ -58,7 +58,11 @@ async function show(req, res) {
   const [rows] = await pool.query('SELECT * FROM hotels WHERE id = ?', [req.params.id]);
   if (!rows.length) return res.status(404).json({ message: 'Hôtel introuvable' });
   const hotel = parseHotel(rows[0]);
-  const [rooms]   = await pool.query('SELECT * FROM rooms WHERE hotel_id = ? ORDER BY number', [hotel.id]);
+  const [roomRows] = await pool.query('SELECT * FROM rooms WHERE hotel_id = ? ORDER BY number', [hotel.id]);
+  const rooms = roomRows.map(r => ({
+    ...r,
+    image_url: r.image ? (r.image.startsWith('http') ? r.image : `${APP_URL}/storage/${r.image}`) : null,
+  }));
   const [reviews] = await pool.query(
     'SELECT r.*, u.name as user_name FROM reviews r JOIN users u ON r.user_id = u.id WHERE r.hotel_id = ? AND r.status = ? ORDER BY r.created_at DESC LIMIT 10',
     [hotel.id, 'approved']

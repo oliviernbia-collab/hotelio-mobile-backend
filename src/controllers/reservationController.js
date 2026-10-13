@@ -108,7 +108,7 @@ async function index(req, res) {
 async function show(req, res) {
   const [rows] = await pool.query(
     `SELECT res.*,
-            c.first_name, c.last_name, c.email AS client_email, c.phone AS client_phone,
+            c.first_name, c.last_name, c.email AS client_email, c.phone AS client_phone, c.user_id AS client_user_id,
             h.name AS hotel_name, h.short_name AS hotel_short_name, h.city AS hotel_city, h.stars AS hotel_stars,
             r.number AS room_number, r.type AS room_type, r.price AS room_price
      FROM reservations res
@@ -119,6 +119,9 @@ async function show(req, res) {
     [req.params.id]
   );
   if (!rows.length) return res.status(404).json({ message: 'Réservation introuvable' });
+  if (!(await canAccessReservation(req.user, rows[0]))) {
+    return res.status(403).json({ message: 'Accès refusé à cette réservation.' });
+  }
   const [factures] = await pool.query('SELECT * FROM factures WHERE reservation_id = ?', [rows[0].id]);
   res.json({ ...rows[0], factures });
 }
@@ -250,6 +253,14 @@ async function mine(req, res) {
   res.json(rows);
 }
 
+// Vérifie que l'utilisateur a le droit de CONSULTER ou PAYER cette réservation précise :
+// admin, staff de l'hôtel concerné, ou le client qui en est le propriétaire.
+async function canAccessReservation(user, reservation) {
+  if (user.role === 'admin') return true;
+  if (user.role === 'client') return reservation.client_user_id === user.id;
+  return canManageHotel(user, reservation.hotel_id);
+}
+
 // Vérifie que l'utilisateur a le droit de changer le statut de CETTE réservation précise.
 // Un client ne peut qu'annuler sa propre réservation ; le staff est limité à son périmètre d'hôtel.
 async function canUpdateReservationStatus(user, reservation, newStatus) {
@@ -307,6 +318,9 @@ async function updateStatus(req, res) {
 async function checkin(req, res) {
   const [rows] = await pool.query('SELECT * FROM reservations WHERE id = ?', [req.params.id]);
   if (!rows.length) return res.status(404).json({ message: 'Réservation introuvable' });
+  if (!(await canManageHotel(req.user, rows[0].hotel_id))) {
+    return res.status(403).json({ message: 'Accès refusé à cette réservation.' });
+  }
   await pool.query("UPDATE reservations SET checkin_at = NOW(), status = 'confirmée', updated_at = NOW() WHERE id = ?", [req.params.id]);
   if (rows[0].room_id) {
     await pool.query("UPDATE rooms SET status = 'occupée', updated_at = NOW() WHERE id = ?", [rows[0].room_id]);
@@ -318,6 +332,9 @@ async function checkin(req, res) {
 async function checkout(req, res) {
   const [rows] = await pool.query('SELECT * FROM reservations WHERE id = ?', [req.params.id]);
   if (!rows.length) return res.status(404).json({ message: 'Réservation introuvable' });
+  if (!(await canManageHotel(req.user, rows[0].hotel_id))) {
+    return res.status(403).json({ message: 'Accès refusé à cette réservation.' });
+  }
   await pool.query("UPDATE reservations SET checkout_at = NOW(), status = 'complétée', updated_at = NOW() WHERE id = ?", [req.params.id]);
   if (rows[0].room_id) {
     await pool.query("UPDATE rooms SET status = 'en_nettoyage', updated_at = NOW() WHERE id = ?", [rows[0].room_id]);
@@ -330,9 +347,18 @@ async function checkout(req, res) {
 
 async function processPayment(req, res) {
   const { payment_method } = req.body;
-  const [rows] = await pool.query('SELECT * FROM reservations WHERE id = ?', [req.params.id]);
+  const [rows] = await pool.query(
+    `SELECT res.*, c.user_id AS client_user_id
+     FROM reservations res JOIN clients c ON res.client_id = c.id
+     WHERE res.id = ?`,
+    [req.params.id]
+  );
   if (!rows.length) return res.status(404).json({ message: 'Réservation introuvable' });
   const reservation = rows[0];
+
+  if (!(await canAccessReservation(req.user, reservation))) {
+    return res.status(403).json({ message: 'Accès refusé à cette réservation.' });
+  }
 
   if (reservation.paid) {
     return res.json({ message: 'Paiement déjà confirmé', paid: true });
@@ -361,8 +387,8 @@ async function processPayment(req, res) {
         type: 'redirect',
         data: {
           paymentMethod: jekoMethod,
-          successUrl: `${appUrl}/payment/bridge?result=success`,
-          errorUrl: `${appUrl}/payment/bridge?result=error`,
+          successUrl: `${appUrl}/payment/bridge?result=success&ref=${encodeURIComponent(reference)}`,
+          errorUrl: `${appUrl}/payment/bridge?result=error&ref=${encodeURIComponent(reference)}`,
         },
       },
     });

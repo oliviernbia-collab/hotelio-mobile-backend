@@ -32,6 +32,13 @@ async function index(req, res) {
   if (req.user.role === 'prestataire') {
     sql += ' AND h.user_id = ?';
     params.push(req.user.id);
+  } else if (req.user.role === 'employe') {
+    if (!req.user.hotel_id) return res.json([]);
+    sql += ' AND s.hotel_id = ?';
+    params.push(req.user.hotel_id);
+  } else if (req.user.role !== 'admin') {
+    // Un client n'a aucune raison de voir le personnel (noms, salaires...).
+    return res.json([]);
   }
   if (hotel_id) { sql += ' AND s.hotel_id = ?'; params.push(hotel_id); }
   if (status)   { sql += ' AND s.status = ?';   params.push(status); }
@@ -47,6 +54,9 @@ async function show(req, res) {
     [req.params.id]
   );
   if (!rows.length) return res.status(404).json({ message: 'Employé introuvable' });
+  if (!(await canManageHotel(req.user, rows[0].hotel_id))) {
+    return res.status(403).json({ message: 'Accès refusé à cet employé.' });
+  }
   const [schedules] = await pool.query(
     'SELECT * FROM staff_schedules WHERE staff_id = ? ORDER BY date DESC LIMIT 30',
     [req.params.id]
@@ -136,6 +146,16 @@ async function getSchedules(req, res) {
              JOIN hotels h ON ss.hotel_id = h.id
              WHERE 1=1`;
   const params = [];
+  if (req.user.role === 'prestataire') {
+    sql += ' AND h.user_id = ?';
+    params.push(req.user.id);
+  } else if (req.user.role === 'employe') {
+    if (!req.user.hotel_id) return res.json([]);
+    sql += ' AND ss.hotel_id = ?';
+    params.push(req.user.hotel_id);
+  } else if (req.user.role !== 'admin') {
+    return res.json([]);
+  }
   if (hotel_id) { sql += ' AND ss.hotel_id = ?'; params.push(hotel_id); }
   if (staff_id) { sql += ' AND ss.staff_id = ?'; params.push(staff_id); }
   if (date) { sql += ' AND ss.date = ?'; params.push(date); }
@@ -148,6 +168,13 @@ async function createSchedule(req, res) {
   const { staff_id, hotel_id, date, shift, start_time, end_time, poste, notes } = req.body;
   if (!staff_id || !hotel_id || !date || !shift) {
     return res.status(422).json({ message: 'staff_id, hotel_id, date et shift requis' });
+  }
+  if (!(await canManageHotel(req.user, hotel_id))) {
+    return res.status(403).json({ message: 'Accès refusé à cet hôtel.' });
+  }
+  const [staffRows] = await pool.query('SELECT hotel_id FROM staff WHERE id = ?', [staff_id]);
+  if (!staffRows.length || Number(staffRows[0].hotel_id) !== Number(hotel_id)) {
+    return res.status(422).json({ message: "Cet employé n'appartient pas à cet hôtel." });
   }
   const [result] = await pool.query(
     'INSERT INTO staff_schedules (staff_id, hotel_id, date, shift, start_time, end_time, poste, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',

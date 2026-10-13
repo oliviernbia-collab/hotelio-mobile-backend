@@ -38,6 +38,9 @@ async function show(req, res) {
     [req.params.id]
   );
   if (!rows.length) return res.status(404).json({ message: 'Ticket introuvable' });
+  if (!(await canManageHotel(req.user, rows[0].hotel_id))) {
+    return res.status(403).json({ message: 'Accès refusé à ce ticket.' });
+  }
   res.json(rows[0]);
 }
 

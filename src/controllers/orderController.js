@@ -2,7 +2,7 @@ const { pool } = require('../config/database');
 const { canManageHotel } = require('../utils/authorize');
 
 async function index(req, res) {
-  const { hotel_id, status, client_id } = req.query;
+  const { hotel_id, status, client_id, from, to } = req.query;
   let sql = `SELECT o.*, m.name as item_name, m.emoji, c.first_name, c.last_name
              FROM orders o
              JOIN menu_items m ON o.menu_item_id = m.id
@@ -22,6 +22,8 @@ async function index(req, res) {
 
   if (status) { sql += ' AND o.status = ?'; params.push(status); }
   if (client_id) { sql += ' AND o.client_id = ?'; params.push(client_id); }
+  if (from) { sql += ' AND o.ordered_at >= ?'; params.push(from); }
+  if (to)   { sql += ' AND o.ordered_at <= ?'; params.push(`${to} 23:59:59`); }
   sql += ' ORDER BY o.created_at DESC';
   const [rows] = await pool.query(sql, params);
   res.json(rows);

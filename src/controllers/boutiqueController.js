@@ -1,5 +1,6 @@
 const { pool } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
+const jeko = require('../services/jeko');
 
 const APP_URL = process.env.APP_URL || 'http://localhost:3001';
 
@@ -145,34 +146,100 @@ async function removeFromCart(req, res) {
   res.json({ message: 'Produit retiré du panier' });
 }
 
+// Colonnes Jèko déjà présentes côté web (table partagée) — guard pour rester idempotent.
+pool.query("ALTER TABLE commandes ADD COLUMN jeko_reference VARCHAR(255) NULL").catch(() => {});
+pool.query("ALTER TABLE commandes ADD COLUMN jeko_payment_request_id VARCHAR(255) NULL").catch(() => {});
+
+// Colonnes commission/reversement automatique déjà présentes côté web (table partagée) —
+// le virement Jèko lui-même reste déclenché côté web (seul backend qui reçoit le webhook
+// Jèko), ce backend ne fait que lire ces colonnes pour l'affichage des reversements.
+pool.query("ALTER TABLE ligne_commandes ADD COLUMN commission_rate DECIMAL(4,2) NULL").catch(() => {});
+pool.query("ALTER TABLE ligne_commandes ADD COLUMN commission_amount INT UNSIGNED NULL").catch(() => {});
+pool.query("ALTER TABLE ligne_commandes ADD COLUMN payout_transfer_id VARCHAR(255) NULL").catch(() => {});
+pool.query("ALTER TABLE ligne_commandes ADD COLUMN payout_status VARCHAR(50) NULL").catch(() => {});
+pool.query("ALTER TABLE ligne_commandes ADD COLUMN payout_failure_reason VARCHAR(255) NULL").catch(() => {});
+
 async function placeOrder(req, res) {
   const { mode_paiement } = req.body;
   const [panier] = await pool.query("SELECT * FROM commandes WHERE user_id = ? AND statut = 'en_attente' LIMIT 1", [req.user.id]);
   if (!panier.length) return res.status(404).json({ message: 'Panier vide' });
   const [items] = await pool.query('SELECT * FROM ligne_commandes WHERE commande_id = ?', [panier[0].id]);
   if (!items.length) return res.status(422).json({ message: 'Panier vide' });
+  const commande = panier[0];
 
-  // Confirmer la commande
-  await pool.query(
-    "UPDATE commandes SET statut = 'confirmée', mode_paiement = ?, updated_at = NOW() WHERE id = ?",
-    [mode_paiement, panier[0].id]
-  );
+  const jekoMethod = jeko.mapPaymentMethod(mode_paiement);
 
-  // Décrémenter les stocks
+  // Décrémenter les stocks tout de suite (réserve l'inventaire pendant le paiement,
+  // même logique que les réservations de chambre et le flux web).
   for (const item of items) {
     await pool.query('UPDATE products SET stock = stock - ? WHERE id = ?', [item.quantite, item.product_id]);
   }
 
-  // ── Notifier le(s) prestataire(s) propriétaires des produits ──────────────
+  // Espèces / Virement : aucune passerelle ne les gère, confirmation immédiate (comportement historique)
+  if (!jekoMethod) {
+    await pool.query(
+      "UPDATE commandes SET statut = 'confirmée', mode_paiement = ?, updated_at = NOW() WHERE id = ?",
+      [mode_paiement, commande.id]
+    );
+    await notifyOwnersOfOrder(commande.id, items, req.user.id);
+    return res.json({ message: 'Commande confirmée', paid: true, commande_id: commande.id });
+  }
+
+  const reference = `HOTELIO-CMDM-${commande.id}-${Date.now()}`;
+  const appUrl = process.env.APP_URL || `http://localhost:${process.env.PORT || 3001}`;
+
+  let result;
+  try {
+    result = await jeko.createPaymentRequest({
+      storeId: process.env.JEKO_STORE_ID,
+      amountCents: Math.round(Number(commande.total) * 100),
+      currency: 'XOF',
+      reference,
+      paymentDetails: {
+        type: 'redirect',
+        data: {
+          paymentMethod: jekoMethod,
+          successUrl: `${appUrl}/payment/bridge?result=success&ref=${encodeURIComponent(reference)}`,
+          errorUrl: `${appUrl}/payment/bridge?result=error&ref=${encodeURIComponent(reference)}`,
+        },
+      },
+    });
+  } catch (e) {
+    // Remet le stock et laisse la commande en 'en_attente' (= toujours le panier) pour réessayer.
+    for (const item of items) {
+      await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [item.quantite, item.product_id]);
+    }
+    return res.status(502).json({ message: 'Impossible de contacter Jèko pour le moment.' });
+  }
+
+  if (!result || !result.redirectUrl) {
+    for (const item of items) {
+      await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [item.quantite, item.product_id]);
+    }
+    return res.status(422).json({ message: (result && result.message) || 'Impossible de lancer le paiement. Réessayez ou choisissez un autre moyen.' });
+  }
+
+  // 'en_cours' : paiement lancé, en attente de confirmation (par le webhook, partagé avec le
+  // web) — ni "panier" (en_attente) ni "confirmée" tant que Jèko n'a pas validé.
+  await pool.query(
+    "UPDATE commandes SET statut = 'en_cours', mode_paiement = ?, jeko_reference = ?, jeko_payment_request_id = ?, updated_at = NOW() WHERE id = ?",
+    [mode_paiement, reference, result.id || null, commande.id]
+  );
+  await notifyOwnersOfOrder(commande.id, items, req.user.id);
+
+  res.json({ message: 'Redirection vers Jèko', paid: false, redirectUrl: result.redirectUrl, commande_id: commande.id, reference });
+}
+
+/** Notifie le(s) prestataire(s) propriétaires des produits d'une commande. */
+async function notifyOwnersOfOrder(commandeId, items, buyerUserId) {
   const productIds = items.map(i => i.product_id);
   const [products] = await pool.query(
     'SELECT id, name, emoji, price, user_id FROM products WHERE id IN (?)',
     [productIds]
   );
-  const [buyerRows] = await pool.query('SELECT name FROM users WHERE id = ?', [req.user.id]);
+  const [buyerRows] = await pool.query('SELECT name FROM users WHERE id = ?', [buyerUserId]);
   const buyerName = buyerRows[0]?.name ?? 'Un client';
 
-  // Regrouper par prestataire
   const byPrestataire = {};
   for (const prod of products) {
     if (!prod.user_id) continue;
@@ -194,18 +261,19 @@ async function placeOrder(req, res) {
       'order_placed',
       '🛍️ Nouvelle commande !',
       `${buyerName} a commandé : ${summary}. Total : ${Number(total).toLocaleString()} FCFA`,
-      { order_id: panier[0].id, items: orderItems }
+      { order_id: commandeId, items: orderItems }
     );
   }
-
-  res.json({ message: 'Commande confirmée', commande_id: panier[0].id });
 }
 
 async function myOrders(req, res) {
-  const [rows] = await pool.query(
-    "SELECT c.*, (SELECT COUNT(*) FROM ligne_commandes lc WHERE lc.commande_id = c.id) as nb_items FROM commandes c WHERE c.user_id = ? AND c.statut != 'en_attente' ORDER BY c.created_at DESC",
-    [req.user.id]
-  );
+  const { from, to } = req.query;
+  let sql = "SELECT c.*, (SELECT COUNT(*) FROM ligne_commandes lc WHERE lc.commande_id = c.id) as nb_items FROM commandes c WHERE c.user_id = ? AND c.statut != 'en_attente'";
+  const params = [req.user.id];
+  if (from) { sql += ' AND c.created_at >= ?'; params.push(from); }
+  if (to)   { sql += ' AND c.created_at <= ?'; params.push(`${to} 23:59:59`); }
+  sql += ' ORDER BY c.created_at DESC';
+  const [rows] = await pool.query(sql, params);
   res.json(rows);
 }
 
@@ -247,7 +315,8 @@ async function cancelOrder(req, res) {
   const [rows] = await pool.query('SELECT * FROM commandes WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
   if (!rows.length) return res.status(404).json({ message: 'Commande introuvable' });
   const order = rows[0];
-  if (!['confirmée', 'en_cours'].includes(order.statut)) {
+  // 'payé' : statut défini par le webhook Jèko (partagé avec le web, qui utilise ce mot-là).
+  if (!['confirmée', 'en_cours', 'payé'].includes(order.statut)) {
     return res.status(422).json({ message: 'Cette commande ne peut plus être annulée.' });
   }
 

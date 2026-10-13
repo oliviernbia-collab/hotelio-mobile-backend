@@ -123,8 +123,8 @@ async function pay(req, res) {
         type: 'redirect',
         data: {
           paymentMethod: jekoMethod,
-          successUrl: `${appUrl}/payment/bridge?result=success`,
-          errorUrl: `${appUrl}/payment/bridge?result=error`,
+          successUrl: `${appUrl}/payment/bridge?result=success&ref=${encodeURIComponent(reference)}`,
+          errorUrl: `${appUrl}/payment/bridge?result=error&ref=${encodeURIComponent(reference)}`,
         },
       },
     });
