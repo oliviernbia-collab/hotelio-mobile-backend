@@ -1,6 +1,7 @@
 const { pool } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
 const jeko = require('../services/jeko');
+const refundService = require('../services/refundService');
 
 const APP_URL = process.env.APP_URL || 'http://localhost:3001';
 
@@ -159,6 +160,15 @@ pool.query("ALTER TABLE ligne_commandes ADD COLUMN payout_transfer_id VARCHAR(25
 pool.query("ALTER TABLE ligne_commandes ADD COLUMN payout_status VARCHAR(50) NULL").catch(() => {});
 pool.query("ALTER TABLE ligne_commandes ADD COLUMN payout_failure_reason VARCHAR(255) NULL").catch(() => {});
 
+// Colonnes de remboursement à l'annulation (déjà présentes côté web, table partagée).
+pool.query("ALTER TABLE commandes ADD COLUMN cancelled_at TIMESTAMP NULL").catch(() => {});
+pool.query("ALTER TABLE commandes ADD COLUMN cancellation_fee_amount INT UNSIGNED NULL").catch(() => {});
+pool.query("ALTER TABLE commandes ADD COLUMN admin_fee_amount INT UNSIGNED NULL").catch(() => {});
+pool.query("ALTER TABLE commandes ADD COLUMN refund_amount INT UNSIGNED NULL").catch(() => {});
+pool.query("ALTER TABLE commandes ADD COLUMN refund_transfer_id VARCHAR(255) NULL").catch(() => {});
+pool.query("ALTER TABLE commandes ADD COLUMN refund_status VARCHAR(50) NULL").catch(() => {});
+pool.query("ALTER TABLE commandes ADD COLUMN refund_failure_reason VARCHAR(255) NULL").catch(() => {});
+
 async function placeOrder(req, res) {
   const { mode_paiement } = req.body;
   const [panier] = await pool.query("SELECT * FROM commandes WHERE user_id = ? AND statut = 'en_attente' LIMIT 1", [req.user.id]);
@@ -315,8 +325,19 @@ async function cancelOrder(req, res) {
   const [rows] = await pool.query('SELECT * FROM commandes WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
   if (!rows.length) return res.status(404).json({ message: 'Commande introuvable' });
   const order = rows[0];
-  // 'payé' : statut défini par le webhook Jèko (partagé avec le web, qui utilise ce mot-là).
-  if (!['confirmée', 'en_cours', 'payé'].includes(order.statut)) {
+  // 'payé' : statut défini par le webhook Jèko (partagé avec le web, qui utilise ce mot-là) —
+  // seul cas où de l'argent a réellement transité par Jèko, donc seul cas remboursable via
+  // RefundService. 'confirmée' (cash/virement) et 'en_cours' (paiement Jèko pas encore
+  // confirmé) sont annulés simplement ci-dessous : rien n'a été collecté côté Jèko.
+  if (order.statut === 'payé' || order.statut === 'payée') {
+    const result = await refundService.cancelCommande(order);
+    if (!result.ok) {
+      return res.status(422).json({ error: result.error, message: result.message });
+    }
+    return res.json({ message: result.message, refund: { fee: result.fee, amount: result.refundAmount, status: result.refundStatus } });
+  }
+
+  if (!['confirmée', 'en_cours'].includes(order.statut)) {
     return res.status(422).json({ message: 'Cette commande ne peut plus être annulée.' });
   }
 

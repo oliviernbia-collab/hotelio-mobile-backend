@@ -129,4 +129,22 @@ async function updatePayout(req, res) {
   res.json({ message: 'Coordonnées de paiement enregistrées' });
 }
 
-module.exports = { show, update, changePassword, uploadAvatar, updatePayout };
+/**
+ * Désactivation de compte en self-service (status -> inactif), miroir de
+ * webPHP/app/Http/Controllers/ProfileController::destroy(). Ne supprime aucune donnée
+ * liée (réservations, factures...) — bloque simplement la connexion.
+ */
+async function deactivate(req, res) {
+  const { password } = req.body;
+  if (!password) return res.status(422).json({ message: 'Mot de passe requis' });
+
+  const [rows] = await pool.query('SELECT password FROM users WHERE id = ?', [req.user.id]);
+  const valid = await bcrypt.compare(password, rows[0].password);
+  if (!valid) return res.status(422).json({ message: 'Mot de passe incorrect' });
+
+  await pool.query("UPDATE users SET status = 'inactif', updated_at = NOW() WHERE id = ?", [req.user.id]);
+
+  res.json({ message: 'Compte désactivé.' });
+}
+
+module.exports = { show, update, changePassword, uploadAvatar, updatePayout, deactivate };

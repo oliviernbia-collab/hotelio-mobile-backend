@@ -1,6 +1,7 @@
 const { pool } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
 const jeko = require('../services/jeko');
+const refundService = require('../services/refundService');
 const { canManageHotel } = require('../utils/authorize');
 
 /* Notification in-app (lue aussi bien par le web que par le mobile, même table `notifications`) */
@@ -271,21 +272,32 @@ async function canUpdateReservationStatus(user, reservation, newStatus) {
   return false;
 }
 
-// Annule les effets comptables de markReservationPaid() quand une réservation payée est annulée :
-// la commission déjà calculée est remise à zéro et les statistiques (hôtel, client) sont décrémentées.
-// Le paiement lui-même (`paid`) n'est pas touché — un éventuel remboursement reste géré manuellement.
-async function reverseCommissionAndStats(reservation) {
+/**
+ * Reverse automatiquement la part du propriétaire (total − commission) vers son contact
+ * Jèko, uniquement quand l'argent est réellement passé par le compte Jèko de la plateforme
+ * (réservation commissionnable). Déclenché au check-in réel (le séjour commence, plus de
+ * risque d'annulation) — jamais à la confirmation du paiement, pour que le remboursement
+ * total reste possible tant que le client n'a pas commencé son séjour. Miroir de
+ * DashboardController::triggerOwnerPayout côté web ; filet de sécurité partagé via la
+ * commande planifiée Laravel `payouts:release-due` (même base) si le check-in n'est jamais
+ * pointé dans l'app.
+ */
+async function triggerOwnerPayout(reservation) {
+  if (reservation.payout_transfer_id) return; // déjà déclenché (idempotence)
+  if (!COMMISSIONABLE_CHANNELS.includes(reservation.channel)) return;
+
+  const [[hotel]] = await pool.query('SELECT user_id FROM hotels WHERE id = ?', [reservation.hotel_id]);
+  if (!hotel || !hotel.user_id) return;
+
+  const netAmount = Number(reservation.total) - Number(reservation.commission_amount || 0);
+  const reference = `PAYOUT-RES-${reservation.id}`;
+
+  const result = await refundService.transferToUser(hotel.user_id, netAmount, reference, `Reversement réservation ${reservation.code}`);
+  if (result.status === null) return;
+
   await pool.query(
-    'UPDATE hotels SET revenue = GREATEST(revenue - ?, 0), checkins = GREATEST(checkins - 1, 0) WHERE id = ?',
-    [reservation.total, reservation.hotel_id]
-  );
-  await pool.query(
-    'UPDATE clients SET total_spend = GREATEST(total_spend - ?, 0), total_stays = GREATEST(total_stays - 1, 0) WHERE id = ?',
-    [reservation.total, reservation.client_id]
-  );
-  await pool.query(
-    'UPDATE reservations SET commission_rate = NULL, commission_amount = NULL WHERE id = ?',
-    [reservation.id]
+    'UPDATE reservations SET payout_transfer_id = ?, payout_status = ?, payout_failure_reason = ? WHERE id = ?',
+    [result.transfer_id, result.status, result.failure_reason, reservation.id]
   );
 }
 
@@ -307,8 +319,12 @@ async function updateStatus(req, res) {
     return res.status(403).json({ message: 'Accès refusé à cette réservation.' });
   }
 
-  if (status === 'annulée' && reservation.status !== 'annulée' && reservation.paid) {
-    await reverseCommissionAndStats(reservation);
+  if (status === 'annulée' && reservation.status !== 'annulée') {
+    const result = await refundService.cancelReservation(reservation);
+    if (!result.ok) {
+      return res.status(422).json({ error: result.error, message: result.message });
+    }
+    return res.json({ message: result.message, status: 'annulée', refund: { fee: result.fee, amount: result.refundAmount, status: result.refundStatus } });
   }
 
   await pool.query('UPDATE reservations SET status = ?, updated_at = NOW() WHERE id = ?', [status, req.params.id]);
@@ -326,6 +342,13 @@ async function checkin(req, res) {
     await pool.query("UPDATE rooms SET status = 'occupée', updated_at = NOW() WHERE id = ?", [rows[0].room_id]);
   }
   await pool.query("UPDATE hotels SET checkins = checkins + 1 WHERE id = ?", [rows[0].hotel_id]);
+
+  // Le séjour commence : plus de risque d'annulation, on peut reverser le prestataire.
+  if (rows[0].paid) {
+    const [fresh] = await pool.query('SELECT * FROM reservations WHERE id = ?', [req.params.id]);
+    await triggerOwnerPayout(fresh[0]);
+  }
+
   res.json({ message: 'Check-in enregistré' });
 }
 

@@ -8,6 +8,7 @@ router.get('/:id',            authenticate, ctrl.show);
 router.put('/:id',            authenticate, ctrl.update);
 router.patch('/:id/pay',      authenticate, ctrl.pay);
 router.delete('/:id',         authenticate, ctrl.destroy);
+router.get('/:id/download-token', authenticate, ctrl.downloadToken);
 router.get('/:id/download',   ctrl.download);
 
 module.exports = router;

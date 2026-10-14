@@ -298,6 +298,31 @@ async function destroy(req, res) {
 
 // ─── download ─────────────────────────────────────────────────────────────────
 
+/**
+ * Jeton de téléchargement à usage unique (2 minutes, scopé à une facture précise) —
+ * évite d'exposer le token de session longue durée en clair dans une URL ouverte via
+ * Linking.openURL (historique navigateur/logs). L'autorisation (propriétaire ou
+ * gestionnaire de l'hôtel) est vérifiée ici, une seule fois, à l'émission du jeton.
+ */
+async function downloadToken(req, res) {
+  const [rows] = await pool.query('SELECT client_user_id, hotel_id FROM facturations WHERE id = ?', [req.params.id]);
+  if (!rows.length) return res.status(404).json({ message: 'Facturation introuvable' });
+
+  const f = rows[0];
+  const isOwnInvoice = f.client_user_id && Number(f.client_user_id) === Number(req.user.id);
+  if (req.user.role !== 'admin' && !isOwnInvoice && !(await canManageHotel(req.user, f.hotel_id))) {
+    return res.status(403).json({ message: 'Accès refusé à cette facture.' });
+  }
+
+  const token = jwt.sign(
+    { purpose: 'facture-download', factureId: Number(req.params.id) },
+    process.env.JWT_SECRET,
+    { algorithm: 'HS256', expiresIn: '2m' }
+  );
+
+  res.json({ token });
+}
+
 async function download(req, res) {
   const token = req.query.token;
   if (!token) return res.status(401).send('<h1>Non autorisé</h1>');
@@ -305,17 +330,11 @@ async function download(req, res) {
   try {
     decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
   } catch {
-    return res.status(401).send('<h1>Token invalide</h1>');
+    return res.status(401).send('<h1>Lien de téléchargement invalide ou expiré</h1>');
   }
 
-  const [userRows] = await pool.query('SELECT id, role, status FROM users WHERE id = ?', [decoded.id]);
-  if (!userRows.length || userRows[0].status !== 'actif') {
-    return res.status(401).send('<h1>Non autorisé</h1>');
-  }
-  const user = userRows[0];
-  if (user.role === 'employe') {
-    const [staffRows] = await pool.query('SELECT hotel_id FROM staff WHERE user_id = ? LIMIT 1', [user.id]);
-    user.hotel_id = staffRows.length ? staffRows[0].hotel_id : null;
+  if (decoded.purpose !== 'facture-download' || Number(decoded.factureId) !== Number(req.params.id)) {
+    return res.status(401).send('<h1>Lien de téléchargement invalide</h1>');
   }
 
   const [rows] = await pool.query(
@@ -329,10 +348,6 @@ async function download(req, res) {
   if (!rows.length) return res.status(404).send('<h1>Facture introuvable</h1>');
 
   const f = rows[0];
-  const isOwnInvoice = f.client_user_id && Number(f.client_user_id) === Number(user.id);
-  if (!isOwnInvoice && !(await canManageHotel(user, f.hotel_id))) {
-    return res.status(403).send('<h1>Accès refusé à cette facture</h1>');
-  }
   const STATUS_MAP   = { paid: 'Payée', pending: 'En attente', overdue: 'En retard', partial: 'Partielle', draft: 'Brouillon' };
   const STATUS_STYLE = {
     paid:    'background:#D1FAE5;color:#065F46',
@@ -435,4 +450,4 @@ async function download(req, res) {
   res.send(html);
 }
 
-module.exports = { index, show, store, update, pay, destroy, download };
+module.exports = { index, show, store, update, pay, destroy, download, downloadToken };

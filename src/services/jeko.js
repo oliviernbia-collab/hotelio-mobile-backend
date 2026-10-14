@@ -63,4 +63,22 @@ async function deleteContact(contactId) {
   }).catch(() => {});
 }
 
-module.exports = { mapPaymentMethod, createPaymentRequest, getPaymentRequest, createContact, deleteContact };
+/**
+ * Crée un virement sortant (reversement ou remboursement) vers un contact bénéficiaire
+ * déjà enregistré. Réponse de succès : contient `status` (pending|success). Réponse
+ * d'erreur : pas de `status`, contient `id` (code d'erreur) et `message`.
+ */
+async function createTransfer(data) {
+  const res = await fetch(`${JEKO_BASE_URL}/partner_api/transfers`, {
+    method: 'POST',
+    headers: {
+      'X-API-KEY': process.env.JEKO_API_KEY,
+      'X-API-KEY-ID': process.env.JEKO_API_KEY_ID,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(data),
+  });
+  return res.json();
+}
+
+module.exports = { mapPaymentMethod, createPaymentRequest, getPaymentRequest, createContact, deleteContact, createTransfer };
