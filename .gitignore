@@ -6,3 +6,4 @@ src/uploads/*
 !src/uploads/hotels/.gitkeep
 *.log
 .DS_Store
+*.zip

@@ -35,11 +35,19 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+// Les réponses de l'API et de la page-relais de paiement sont propres à chaque requête :
+// on interdit leur mise en cache (l'hébergeur place un cache Varnish devant l'application).
+app.use(['/api', '/payment'], (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(path.join(__dirname, 'src/uploads')));
-// Servir les images stockées par Laravel (webPHP/public/storage, depuis la réorganisation en monorepo)
-app.use('/storage', express.static(path.join(__dirname, '../webPHP/public/storage')));
+// Servir les images stockées par Laravel (webPHP/public/storage, depuis la réorganisation en monorepo).
+// En production, les deux applis ne sont pas côte à côte : WEBPHP_STORAGE_PATH pointe alors
+// vers storage/app/public du Laravel déployé.
+app.use('/storage', express.static(process.env.WEBPHP_STORAGE_PATH || path.join(__dirname, '../webPHP/public/storage')));
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'Hôtelio Mobile API', version: '1.0.0' }));
 
