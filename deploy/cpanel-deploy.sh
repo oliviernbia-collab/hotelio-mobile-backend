@@ -6,7 +6,12 @@ set -euo pipefail
 
 REPO_DIR="$(pwd)"
 APP_DIR="$HOME/backendhoteliomobile"
-NODE_ENV_ACTIVATE="$HOME/nodevenv/backendhoteliomobile/22/bin/activate"
+# Environnement Node créé par cPanel (Setup Node.js App) : ~/nodevenv/<app>/<version>/bin/activate
+NODE_ENV_ACTIVATE="$(ls -d "$HOME"/nodevenv/backendhoteliomobile/*/bin/activate 2>/dev/null | sort -V | tail -1)"
+if [ -z "$NODE_ENV_ACTIVATE" ]; then
+  echo "Environnement Node introuvable dans ~/nodevenv/backendhoteliomobile" >&2
+  exit 1
+fi
 
 echo "==> Copie du code"
 # Mêmes exclusions que deploy-lws.ps1. Sans --delete : .env, node_modules (lien vers
@@ -17,10 +22,15 @@ rsync -a --no-perms --omit-dir-times \
   --exclude='deploy-lws.ps1' --exclude='*.zip' --exclude='*.log' \
   "$REPO_DIR/" "$APP_DIR/"
 
-echo "==> Dépendances"
+echo "==> Dépendances ($NODE_ENV_ACTIVATE)"
+# Le script d'activation de cPanel utilise des variables non définies : set -u le ferait échouer
+set +u
 # shellcheck disable=SC1090
 source "$NODE_ENV_ACTIVATE"
+set -u
 cd "$APP_DIR"
+node --version
+npm --version
 # npm install (pas npm ci) : sur cPanel, node_modules est un lien vers l'environnement Node
 # de l'application, que npm ci supprimerait.
 npm install --omit=dev --no-audit --no-fund
