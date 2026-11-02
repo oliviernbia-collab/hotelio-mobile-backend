@@ -1,0 +1,45 @@
+# Déploiement continu de l'API mobile sur l'hébergement LWS (cPanel → Setup Node.js App, Passenger).
+# À chaque push sur main : cPanel récupère le dépôt (Git Version Control), puis exécute
+# .cpanel.yml → deploy/cpanel-deploy.sh (copie, dépendances, redémarrage).
+# Tout passe par l'API cPanel en HTTPS : aucun accès SSH n'est nécessaire.
+#
+# Secrets du dépôt (Settings → Secrets and variables → Actions) :
+#   CPANEL_HOST       hôte cPanel, sans https:// (hotelio-ci.site)
+#   CPANEL_USER       utilisateur cPanel (c2885610c)
+#   CPANEL_API_TOKEN  jeton créé dans cPanel → Gérer les jetons d'API
+name: Déploiement API (LWS)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-api
+  cancel-in-progress: false
+
+env:
+  REPO_NAME: hotelio-mobile-backend   # copie du dépôt dans cPanel : ~/repositories/hotelio-mobile-backend
+  HEALTH_URL: https://api.hotelio-ci.site/api/health
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Déploiement via cPanel
+        env:
+          CPANEL_HOST: ${{ secrets.CPANEL_HOST }}
+          CPANEL_USER: ${{ secrets.CPANEL_USER }}
+          CPANEL_API_TOKEN: ${{ secrets.CPANEL_API_TOKEN }}
+        run: bash .github/scripts/cpanel-deploy.sh "/home/$CPANEL_USER/repositories/$REPO_NAME" main
+
+      - name: Vérification de l'API
+        run: |
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$HEALTH_URL")
+            echo "Tentative $i : HTTP $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 10
+          done
+          exit 1

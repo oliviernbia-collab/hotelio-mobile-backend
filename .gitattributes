@@ -1,0 +1,3 @@
+# Scripts exécutés sur des serveurs Linux : fins de ligne LF obligatoires
+*.sh text eol=lf
+.cpanel.yml text eol=lf

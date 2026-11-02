@@ -1,0 +1,6 @@
+# Déploiement cPanel (Git Version Control) de l'API mobile : voir deploy/cpanel-deploy.sh.
+# Lancé automatiquement par .github/workflows/deploy.yml après chaque push sur main.
+---
+deployment:
+  tasks:
+    - /bin/bash deploy/cpanel-deploy.sh
