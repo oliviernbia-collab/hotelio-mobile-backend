@@ -1,6 +1,7 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
+const { notifyUser } = require('../services/notify');
 
 function generateToken(user) {
   return jwt.sign(
@@ -109,6 +110,17 @@ async function register(req, res) {
     });
   }
 
+  // Bienvenue, comme WelcomeNotification côté web (comptes actifs immédiatement, pas les
+  // prestataires en attente de validation)
+  const roleLabel = finalRole.charAt(0).toUpperCase() + finalRole.slice(1);
+  await notifyUser(
+    newUser[0].id,
+    'welcome',
+    'Bienvenue sur Hôtelio !',
+    `Votre compte ${roleLabel} est prêt. Explorez la plateforme !`,
+    { icon: 'fa-hands-clapping', color: '#F77F00' }
+  );
+
   const token = generateToken(newUser[0]);
   res.status(201).json({ token, user: newUser[0] });
 }
@@ -137,10 +149,21 @@ async function logout(req, res) {
   res.json({ message: 'Déconnecté avec succès' });
 }
 
+/* Révoque toutes les sessions de l'utilisateur (ex. téléphone perdu ou volé) — équivalent de
+   Api\AuthController::logoutAll côté web. Le jeton courant est révoqué lui aussi. */
+async function logoutAll(req, res) {
+  await pool.query('UPDATE users SET tokens_valid_after = NOW() + INTERVAL 1 SECOND, updated_at = NOW() WHERE id = ?', [req.user.id]);
+  await pool.query(
+    "INSERT INTO activity_logs (user_id, user_name, user_role, action, description, ip_address) VALUES (?, ?, ?, 'logout', ?, ?)",
+    [req.user.id, req.user.name, req.user.role, `Déconnexion de tous les appareils (${req.user.name})`, req.ip]
+  ).catch(() => {});
+  res.json({ message: 'Déconnecté de tous les appareils.' });
+}
+
 async function forgotPassword(req, res) {
   const { email } = req.body;
   const [rows] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
   res.json({ message: "Si cet email existe, un lien de réinitialisation a été envoyé." });
 }
 
-module.exports = { login, register, me, logout, forgotPassword, generateToken, withAvatarUrl, sanitizeUser };
+module.exports = { login, register, me, logout, logoutAll, forgotPassword, generateToken, withAvatarUrl, sanitizeUser };

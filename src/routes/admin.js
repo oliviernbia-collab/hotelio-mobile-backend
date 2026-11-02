@@ -4,6 +4,7 @@ const reportCtrl = require('../controllers/reportController');
 const settingsCtrl = require('../controllers/settingsController');
 const subscriptionCtrl = require('../controllers/subscriptionController');
 const payoutCtrl = require('../controllers/payoutController');
+const boutiqueCtrl = require('../controllers/boutiqueController');
 const { authenticate, isAdmin } = require('../middleware/auth');
 
 router.use(authenticate, isAdmin);
@@ -26,7 +27,12 @@ router.get('/settings', settingsCtrl.get);
 router.get('/subscriptions', subscriptionCtrl.adminList);
 router.post('/subscriptions/:id/payment', subscriptionCtrl.recordPayment);
 
+router.get('/orders', boutiqueCtrl.adminOrders);
+
 router.get('/payouts', payoutCtrl.adminList);
+router.get('/payouts/failed', payoutCtrl.failed);
+router.post('/payouts/retry/:id', payoutCtrl.retryReservation);
+router.post('/payouts/retry-commande/:id', payoutCtrl.retryLigne);
 router.post('/payouts/:userId', payoutCtrl.recordPayout);
 
 module.exports = router;

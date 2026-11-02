@@ -6,5 +6,7 @@ router.get('/me',        authenticate, ctrl.me);
 router.post('/check-in', authenticate, ctrl.checkIn);
 router.post('/check-out',authenticate, ctrl.checkOut);
 router.get('/report',    authenticate, ctrl.report);
+router.get('/export-token', authenticate, ctrl.exportToken);
+router.get('/export',    ctrl.exportCsv); // authentifié par le jeton de téléchargement
 
 module.exports = router;

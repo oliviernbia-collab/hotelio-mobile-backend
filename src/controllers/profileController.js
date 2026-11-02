@@ -106,7 +106,7 @@ async function updatePayout(req, res) {
 
   const identifier = isBank
     ? { bankName: bank_name, bankCode: bank_code, swiftCode: swift_code, agencyCode: agency_code, accountNumber: account_number, key: rib_key }
-    : { number: phone_number };
+    : { number: jeko.toInternationalNumber(phone_number) };
 
   const [userRows] = await pool.query('SELECT name, jeko_contact_id FROM users WHERE id = ?', [req.user.id]);
   const user = userRows[0];
@@ -122,8 +122,13 @@ async function updatePayout(req, res) {
     [payout_method, JSON.stringify(identifier), result.id, req.user.id]
   );
 
-  if (user.jeko_contact_id) {
-    jeko.deleteContact(user.jeko_contact_id).catch(() => {});
+  // Jèko renvoie le contact existant pour un bénéficiaire déjà connu (même numéro) : l'ancien
+  // contact peut donc être celui qu'on vient d'enregistrer, ou être partagé avec un autre compte
+  // (ex. client et prestataire avec le même numéro). Le supprimer casserait les virements.
+  const oldId = user.jeko_contact_id;
+  if (oldId && oldId !== result.id) {
+    const [[shared]] = await pool.query('SELECT COUNT(*) AS n FROM users WHERE jeko_contact_id = ?', [oldId]);
+    if (!shared.n) jeko.deleteContact(oldId).catch(() => {});
   }
 
   res.json({ message: 'Coordonnées de paiement enregistrées' });

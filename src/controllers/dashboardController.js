@@ -6,11 +6,14 @@ async function index(req, res) {
   try {
     // ── CLIENT ───────────────────────────────────────────────────────────────
     if (role === 'client') {
+      // Même règle que le tableau de bord client web (DashboardController::client) : dépenses et
+      // séjours = réservations payées et non annulées (une annulation est remboursée) ;
+      // points = points_fidelite (crédités au check-out, ajustables par l'hôtel).
       // Lookup by user_id first (most reliable), then fall back to email
       const clientQuery = `
         SELECT c.*,
-          COALESCE(SUM(CASE WHEN r.status IN ('confirmée','terminée','complétée') THEN r.total ELSE 0 END), 0) AS calc_spend,
-          COUNT(CASE WHEN r.status IN ('confirmée','terminée','complétée') THEN 1 END) AS calc_stays
+          COALESCE(SUM(CASE WHEN r.paid = 1 AND r.status <> 'annulée' THEN r.total ELSE 0 END), 0) AS calc_spend,
+          COUNT(CASE WHEN r.paid = 1 AND r.status <> 'annulée' THEN 1 END) AS calc_stays
         FROM clients c
         LEFT JOIN reservations r ON r.client_id = c.id
         WHERE c.user_id = ?
@@ -20,8 +23,8 @@ async function index(req, res) {
       if (!clientRows.length) {
         const clientQueryByEmail = `
           SELECT c.*,
-            COALESCE(SUM(CASE WHEN r.status IN ('confirmée','terminée','complétée') THEN r.total ELSE 0 END), 0) AS calc_spend,
-            COUNT(CASE WHEN r.status IN ('confirmée','terminée','complétée') THEN 1 END) AS calc_stays
+            COALESCE(SUM(CASE WHEN r.paid = 1 AND r.status <> 'annulée' THEN r.total ELSE 0 END), 0) AS calc_spend,
+            COUNT(CASE WHEN r.paid = 1 AND r.status <> 'annulée' THEN 1 END) AS calc_stays
           FROM clients c
           LEFT JOIN reservations r ON r.client_id = c.id
           WHERE c.email = ?
@@ -70,7 +73,7 @@ async function index(req, res) {
       const [[totalUsers]]        = await pool.query("SELECT COUNT(*) as count FROM users WHERE status = 'actif'");
       const [[totalHotels]]       = await pool.query('SELECT COUNT(*) as count FROM hotels');
       const [[totalReservations]] = await pool.query('SELECT COUNT(*) as count FROM reservations');
-      const [[revenue]]           = await pool.query("SELECT COALESCE(SUM(total),0) as total FROM reservations WHERE status IN ('confirmée','terminée')");
+      const [[revenue]]           = await pool.query("SELECT COALESCE(SUM(total),0) as total FROM reservations WHERE status IN ('confirmée','arrivée','départie','terminée')");
 
       const [recentRes] = await pool.query(
         `SELECT res.id, res.code, res.status, res.checkin, res.checkout,
@@ -115,7 +118,7 @@ async function index(req, res) {
       const [[totalRevenue]] = await pool.query(
         `SELECT COALESCE(SUM(res.total),0) as total FROM reservations res
          JOIN hotels h ON res.hotel_id = h.id
-         WHERE h.user_id = ? AND res.status IN ('confirmée','terminée')`, [userId]
+         WHERE h.user_id = ? AND res.status IN ('confirmée','arrivée','départie','terminée')`, [userId]
       );
 
       return res.json({

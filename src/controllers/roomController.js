@@ -29,6 +29,26 @@ async function index(req, res) {
   if (floor) { sql += ' AND r.floor = ?'; params.push(parseInt(floor)); }
   sql += ' ORDER BY r.floor, r.number';
   const [rows] = await pool.query(sql, params);
+
+  // Avec des dates : disponibilité réelle sur la période, comme la page hôtel du web — une
+  // chambre est prise si une réservation non annulée chevauche les dates, quel que soit son
+  // état du moment (une chambre « réservée » demain peut être libre la semaine prochaine).
+  const { checkin, checkout } = req.query;
+  if (checkin && checkout && rows.length) {
+    const [booked] = await pool.query(
+      `SELECT DISTINCT room_id, hotel_id, room FROM reservations
+       WHERE hotel_id IN (?) AND status NOT IN ('annulée', 'cancelled', 'refusée')
+         AND checkin < ? AND checkout > ?`,
+      [[...new Set(rows.map((r) => r.hotel_id))], checkout, checkin]
+    );
+    const takenIds = new Set(booked.map((b) => b.room_id).filter(Boolean));
+    const takenNumbers = new Set(booked.map((b) => `${b.hotel_id}:${b.room}`));
+    return res.json(rows.map((r) => ({
+      ...parseRoom(r),
+      available: !takenIds.has(r.id) && !takenNumbers.has(`${r.hotel_id}:${r.number}`),
+    })));
+  }
+
   res.json(rows.map(parseRoom));
 }
 

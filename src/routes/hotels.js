@@ -35,6 +35,7 @@ router.get('/:id',    ctrl.show);
 router.post('/',      authenticate, withUpload, ctrl.store);
 router.put('/:id',    authenticate, withUpload, ctrl.update);
 router.delete('/:id', authenticate, ctrl.destroy);
+router.get('/:id/my-review', authenticate, ctrl.myReview);
 router.post('/:id/reviews',  authenticate, ctrl.addReview);
 router.post('/:id/favorite', authenticate, ctrl.toggleFavorite);
 

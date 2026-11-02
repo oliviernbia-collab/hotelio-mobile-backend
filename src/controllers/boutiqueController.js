@@ -1,6 +1,9 @@
 const { pool } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
 const jeko = require('../services/jeko');
+const jekoSync = require('../services/jekoSync');
+const { buildOrderReceipt } = require('../services/receipts');
+const jwt = require('jsonwebtoken');
 const refundService = require('../services/refundService');
 
 const APP_URL = process.env.APP_URL || 'http://localhost:3001';
@@ -119,7 +122,7 @@ async function addToCart(req, res) {
   let [panier] = await pool.query("SELECT id FROM commandes WHERE user_id = ? AND statut = 'en_attente' LIMIT 1", [req.user.id]);
   let commandeId;
   if (!panier.length) {
-    const [res2] = await pool.query("INSERT INTO commandes (user_id, total, statut) VALUES (?, 0, 'en_attente')", [req.user.id]);
+    const [res2] = await pool.query("INSERT INTO commandes (user_id, total, statut, created_at, updated_at) VALUES (?, 0, 'en_attente', NOW(), NOW())", [req.user.id]);
     commandeId = res2.insertId;
   } else {
     commandeId = panier[0].id;
@@ -129,7 +132,7 @@ async function addToCart(req, res) {
   if (existing.length) {
     await pool.query('UPDATE ligne_commandes SET quantite = quantite + ? WHERE id = ?', [qty, existing[0].id]);
   } else {
-    await pool.query('INSERT INTO ligne_commandes (commande_id, product_id, quantite, prix) VALUES (?, ?, ?, ?)', [commandeId, req.params.id, qty, product[0].price]);
+    await pool.query('INSERT INTO ligne_commandes (commande_id, product_id, quantite, prix, created_at, updated_at) VALUES (?, ?, ?, ?, NOW(), NOW())', [commandeId, req.params.id, qty, product[0].price]);
   }
 
   const [total] = await pool.query('SELECT SUM(quantite * prix) as total FROM ligne_commandes WHERE commande_id = ?', [commandeId]);
@@ -185,12 +188,14 @@ async function placeOrder(req, res) {
     await pool.query('UPDATE products SET stock = stock - ? WHERE id = ?', [item.quantite, item.product_id]);
   }
 
-  // Espèces / Virement : aucune passerelle ne les gère, confirmation immédiate (comportement historique)
+  // Espèces / Virement : aucune passerelle ne les gère, confirmation immédiate. Comme le web
+  // (CommandeController::markCommandePaid) : statut 'payé' et commission Hôtelio sur chaque ligne.
   if (!jekoMethod) {
     await pool.query(
-      "UPDATE commandes SET statut = 'confirmée', mode_paiement = ?, updated_at = NOW() WHERE id = ?",
+      "UPDATE commandes SET statut = 'en_cours', mode_paiement = ?, created_at = NOW(), updated_at = NOW() WHERE id = ?",
       [mode_paiement, commande.id]
     );
+    await jekoSync.markCommandePaid(commande);
     await notifyOwnersOfOrder(commande.id, items, req.user.id);
     return res.json({ message: 'Commande confirmée', paid: true, commande_id: commande.id });
   }
@@ -232,7 +237,7 @@ async function placeOrder(req, res) {
   // 'en_cours' : paiement lancé, en attente de confirmation (par le webhook, partagé avec le
   // web) — ni "panier" (en_attente) ni "confirmée" tant que Jèko n'a pas validé.
   await pool.query(
-    "UPDATE commandes SET statut = 'en_cours', mode_paiement = ?, jeko_reference = ?, jeko_payment_request_id = ?, updated_at = NOW() WHERE id = ?",
+    "UPDATE commandes SET statut = 'en_cours', mode_paiement = ?, jeko_reference = ?, jeko_payment_request_id = ?, created_at = NOW(), updated_at = NOW() WHERE id = ?",
     [mode_paiement, reference, result.id || null, commande.id]
   );
   await notifyOwnersOfOrder(commande.id, items, req.user.id);
@@ -278,6 +283,15 @@ async function notifyOwnersOfOrder(commandeId, items, buyerUserId) {
 
 async function myOrders(req, res) {
   const { from, to } = req.query;
+
+  // Paiements Jèko en attente : on les vérifie auprès de Jèko avant de lister, au cas où le
+  // client n'est pas repassé par /payment/bridge (navigateur fermé) et que le webhook manque.
+  const [pending] = await pool.query(
+    "SELECT * FROM commandes WHERE user_id = ? AND statut = 'en_cours' AND jeko_payment_request_id IS NOT NULL",
+    [req.user.id]
+  );
+  await Promise.all(pending.map((c) => jekoSync.syncCommande(c).catch(() => null)));
+
   let sql = "SELECT c.*, (SELECT COUNT(*) FROM ligne_commandes lc WHERE lc.commande_id = c.id) as nb_items FROM commandes c WHERE c.user_id = ? AND c.statut != 'en_attente'";
   const params = [req.user.id];
   if (from) { sql += ' AND c.created_at >= ?'; params.push(from); }
@@ -324,7 +338,22 @@ async function getOrderItems(req, res) {
 async function cancelOrder(req, res) {
   const [rows] = await pool.query('SELECT * FROM commandes WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
   if (!rows.length) return res.status(404).json({ message: 'Commande introuvable' });
-  const order = rows[0];
+  let order = rows[0];
+
+  // Paiement Jèko lancé mais pas encore confirmé (webhook absent) : on vérifie auprès de Jèko
+  // avant d'annuler, sinon une commande réellement payée serait annulée sans remboursement.
+  if (order.statut === 'en_cours' && order.jeko_payment_request_id) {
+    let status;
+    try {
+      status = await jekoSync.syncCommande(order);
+    } catch (e) {
+      return res.status(502).json({ message: 'Impossible de vérifier le paiement auprès de Jèko. Réessayez dans un instant.' });
+    }
+    if (status === 'success') {
+      [[order]] = await pool.query('SELECT * FROM commandes WHERE id = ?', [order.id]);
+    }
+  }
+
   // 'payé' : statut défini par le webhook Jèko (partagé avec le web, qui utilise ce mot-là) —
   // seul cas où de l'argent a réellement transité par Jèko, donc seul cas remboursable via
   // RefundService. 'confirmée' (cash/virement) et 'en_cours' (paiement Jèko pas encore
@@ -382,7 +411,102 @@ async function cancelOrder(req, res) {
   res.json({ message: 'Commande annulée' });
 }
 
+// Statuts pour lesquels l'achat est réglé (Jèko : 'payé' ; espèces/virement : 'confirmée').
+const RECEIPT_STATUSES = ['payé', 'payée', 'confirmée', 'livrée'];
+
+/* Administration : toutes les commandes boutique (page « Dashboard Commandes » du web). Les
+   paniers en cours ('en_attente') ne sont pas des commandes ; le total des ventes ne compte
+   que les commandes réglées. */
+async function adminOrders(req, res) {
+  const { statut } = req.query;
+  let sql = `SELECT c.id, c.created_at, c.total, c.statut, c.mode_paiement, u.name AS buyer_name,
+                    (SELECT COUNT(*) FROM ligne_commandes lc WHERE lc.commande_id = c.id) AS nb_items
+             FROM commandes c LEFT JOIN users u ON c.user_id = u.id
+             WHERE c.statut <> 'en_attente'`;
+  const params = [];
+  if (statut) { sql += ' AND c.statut = ?'; params.push(statut); }
+  sql += ' ORDER BY c.created_at DESC';
+  const [orders] = await pool.query(sql, params);
+
+  const [[stats]] = await pool.query(
+    `SELECT COUNT(*) AS count,
+            COALESCE(SUM(CASE WHEN statut IN (?) THEN total END), 0) AS total_sales,
+            SUM(statut IN (?)) AS paid,
+            SUM(statut = 'en_cours') AS pending,
+            SUM(statut = 'annulée') AS cancelled
+     FROM commandes WHERE statut <> 'en_attente'`,
+    [RECEIPT_STATUSES, RECEIPT_STATUSES]
+  );
+
+  res.json({
+    stats: {
+      count: Number(stats.count),
+      total_sales: Number(stats.total_sales),
+      paid: Number(stats.paid || 0),
+      pending: Number(stats.pending || 0),
+      cancelled: Number(stats.cancelled || 0),
+    },
+    orders,
+  });
+}
+
+/* Reçu PDF d'achat : jeton de 2 minutes puis lien ouvert dans le navigateur
+   (même mécanisme que le reçu de réservation et les factures). */
+async function receiptToken(req, res) {
+  const [[order]] = await pool.query('SELECT id, user_id, statut FROM commandes WHERE id = ?', [req.params.id]);
+  if (!order) return res.status(404).json({ message: 'Commande introuvable' });
+  if (Number(order.user_id) !== Number(req.user.id) && req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Accès refusé à cette commande.' });
+  }
+  if (!RECEIPT_STATUSES.includes(order.statut)) {
+    return res.status(422).json({ message: 'Le reçu est disponible une fois la commande payée.' });
+  }
+
+  const token = jwt.sign(
+    { purpose: 'order-receipt', orderId: order.id },
+    process.env.JWT_SECRET,
+    { algorithm: 'HS256', expiresIn: '2m' }
+  );
+  res.json({ token });
+}
+
+async function receipt(req, res) {
+  let decoded;
+  try {
+    decoded = jwt.verify(String(req.query.token || ''), process.env.JWT_SECRET, { algorithms: ['HS256'] });
+  } catch {
+    return res.status(401).send('Lien de téléchargement invalide ou expiré.');
+  }
+  if (decoded.purpose !== 'order-receipt' || Number(decoded.orderId) !== Number(req.params.id)) {
+    return res.status(401).send('Lien de téléchargement invalide.');
+  }
+
+  const [[order]] = await pool.query(
+    `SELECT c.*, u.name AS buyer_name, u.email AS buyer_email
+     FROM commandes c LEFT JOIN users u ON c.user_id = u.id
+     WHERE c.id = ?`,
+    [req.params.id]
+  );
+  if (!order || !RECEIPT_STATUSES.includes(order.statut)) return res.status(404).send('Reçu introuvable.');
+
+  const [lines] = await pool.query(
+    `SELECT lc.quantite, lc.prix, p.name FROM ligne_commandes lc
+     LEFT JOIN products p ON lc.product_id = p.id
+     WHERE lc.commande_id = ?`,
+    [order.id]
+  );
+
+  const pdf = await buildOrderReceipt(order, lines);
+  res.set({
+    'Content-Type': 'application/pdf',
+    'Content-Disposition': `attachment; filename="recu_commande_${order.id}.pdf"`,
+    'Content-Length': pdf.length,
+  });
+  res.send(pdf);
+}
+
 module.exports = {
+  receiptToken, receipt, adminOrders,
   getProducts, getProduct, getMyProducts,
   createProduct, updateProduct, deleteProduct,
   getCart, addToCart, removeFromCart,

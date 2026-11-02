@@ -35,4 +35,13 @@ async function destroy(req, res) {
   res.json({ message: 'Notification supprimée' });
 }
 
-module.exports = { index, markRead, markAllRead, destroy };
+// Supprime toutes les notifications de l'utilisateur (NotificationController::destroyAll côté web)
+async function destroyAll(req, res) {
+  await pool.query(
+    "DELETE FROM notifications WHERE notifiable_type = 'App\\\\Models\\\\User' AND notifiable_id = ?",
+    [req.user.id]
+  );
+  res.json({ message: 'Toutes les notifications ont été supprimées.' });
+}
+
+module.exports = { index, markRead, markAllRead, destroy, destroyAll };

@@ -1,4 +1,5 @@
 const { pool } = require('../config/database');
+const { notifyUser } = require('../services/notify');
 const { canManageHotel } = require('../utils/authorize');
 
 const APP_URL = process.env.APP_URL || 'http://localhost:3001';
@@ -151,9 +152,45 @@ async function destroy(req, res) {
   res.json({ message: 'Hôtel supprimé' });
 }
 
+// Avis de l'utilisateur connecté sur cet hôtel, quel que soit son statut de modération
+// (la page hôtel web l'affiche et pré-remplit le formulaire avec).
+async function myReview(req, res) {
+  const [[review]] = await pool.query(
+    'SELECT id, rating, title, comment, status, created_at, updated_at FROM reviews WHERE hotel_id = ? AND user_id = ?',
+    [req.params.id, req.user.id]
+  );
+  res.json(review || null);
+}
+
+// Suppression d'un avis : son auteur ou un admin (Api\ReviewController::destroy côté web)
+async function deleteReview(req, res) {
+  const [[review]] = await pool.query('SELECT id, user_id FROM reviews WHERE id = ?', [req.params.id]);
+  if (!review) return res.status(404).json({ message: 'Avis introuvable' });
+  if (req.user.role !== 'admin' && Number(review.user_id) !== Number(req.user.id)) {
+    return res.status(403).json({ message: 'Accès refusé à cet avis.' });
+  }
+  await pool.query('DELETE FROM reviews WHERE id = ?', [review.id]);
+  res.json({ message: 'Avis supprimé.' });
+}
+
 async function addReview(req, res) {
   const { rating, comment, title } = req.body;
   if (!rating || !comment) return res.status(422).json({ message: 'Note et commentaire requis' });
+  // Mêmes règles que ReviewController::store côté web
+  const note = Number(rating);
+  const text = String(comment).trim();
+  if (!Number.isInteger(note) || note < 1 || note > 5) {
+    return res.status(422).json({ message: 'La note doit être comprise entre 1 et 5.' });
+  }
+  if (text.length < 10 || text.length > 2000) {
+    return res.status(422).json({ message: 'Le commentaire doit contenir entre 10 et 2000 caractères.' });
+  }
+  if (title && String(title).length > 200) {
+    return res.status(422).json({ message: 'Le titre ne peut pas dépasser 200 caractères.' });
+  }
+  const [[hotel]] = await pool.query('SELECT id, name, user_id FROM hotels WHERE id = ?', [req.params.id]);
+  if (!hotel) return res.status(404).json({ message: 'Hôtel introuvable' });
+
   const [existing] = await pool.query('SELECT id FROM reviews WHERE hotel_id = ? AND user_id = ?', [req.params.id, req.user.id]);
   if (existing.length) {
     await pool.query('UPDATE reviews SET rating = ?, comment = ?, title = ?, status = ?, updated_at = NOW() WHERE hotel_id = ? AND user_id = ?',
@@ -162,6 +199,19 @@ async function addReview(req, res) {
     await pool.query('INSERT INTO reviews (hotel_id, user_id, rating, comment, title, status) VALUES (?, ?, ?, ?, ?, ?)',
       [req.params.id, req.user.id, rating, comment, title, 'pending']);
   }
+
+  // Notifier le propriétaire de l'hôtel (NewReviewNotification côté web : app + e-mail)
+  if (hotel.user_id && Number(hotel.user_id) !== Number(req.user.id)) {
+    await notifyUser(
+      hotel.user_id,
+      'new_review',
+      'Nouvel avis client',
+      `${note}/5 étoiles sur ${hotel.name} — "${text}"`,
+      { icon: 'fa-star', color: '#F77F00' },
+      { withEmail: true }
+    );
+  }
+
   res.json({ message: 'Avis soumis, en attente de validation' });
 }
 
@@ -187,4 +237,4 @@ async function logActivity(user, action, model, modelId, description, ip) {
   ).catch(() => {});
 }
 
-module.exports = { index, mine, show, store, update, destroy, addReview, toggleFavorite };
+module.exports = { index, mine, show, store, update, destroy, addReview, deleteReview, myReview, toggleFavorite };

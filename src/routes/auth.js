@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
-const { login, register, me, logout, forgotPassword } = require('../controllers/authController');
+const { login, register, me, logout, logoutAll, forgotPassword } = require('../controllers/authController');
 const twoFaCtrl = require('../controllers/twoFaController');
 const { authenticate } = require('../middleware/auth');
 const { proofUpload }  = require('../middleware/upload');
@@ -32,6 +32,7 @@ router.post('/register', registerLimiter, proofUpload.single('proof_document'), 
 router.post('/forgot-password', registerLimiter, forgotPassword);
 router.get('/me', authenticate, me);
 router.post('/logout', authenticate, logout);
+router.post('/logout-all', authenticate, logoutAll);
 
 router.get('/2fa/setup', authenticate, twoFaCtrl.setup);
 router.post('/2fa/enable', authenticate, twoFaCtrl.enable);

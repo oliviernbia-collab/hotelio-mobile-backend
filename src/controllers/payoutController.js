@@ -1,4 +1,6 @@
 const { pool } = require('../config/database');
+const refundService = require('../services/refundService');
+const { triggerOwnerPayout } = require('./reservationController');
 
 const COMMISSIONABLE_CHANNELS = ['Site web', 'App mobile'];
 
@@ -112,4 +114,114 @@ async function recordPayout(req, res) {
   res.json({ message: 'Versement enregistré' });
 }
 
-module.exports = { adminList, recordPayout };
+/* Virements automatiques Jèko en échec (section « Virements échoués » de la page admin web). */
+async function failed(req, res) {
+  const [reservations] = await pool.query(
+    `SELECT res.id, res.code, res.total, res.commission_amount, res.payout_failure_reason,
+            h.name AS hotel_name, h.short_name AS hotel_short_name, u.name AS owner_name
+     FROM reservations res
+     JOIN hotels h ON res.hotel_id = h.id
+     LEFT JOIN users u ON h.user_id = u.id
+     WHERE res.payout_status = 'error'
+     ORDER BY res.updated_at DESC`
+  );
+  const [lignes] = await pool.query(
+    `SELECT lc.id, lc.commande_id, lc.quantite, lc.prix, lc.commission_amount, lc.payout_failure_reason,
+            p.name AS product_name, u.name AS owner_name
+     FROM ligne_commandes lc
+     JOIN products p ON lc.product_id = p.id
+     LEFT JOIN users u ON p.user_id = u.id
+     WHERE lc.payout_status = 'error'
+     ORDER BY lc.updated_at DESC`
+  );
+
+  res.json({
+    reservations: reservations.map((r) => ({
+      id: r.id,
+      code: r.code,
+      owner_name: r.owner_name,
+      hotel_name: r.hotel_short_name || r.hotel_name,
+      net_amount: Number(r.total) - Number(r.commission_amount || 0),
+      reason: r.payout_failure_reason,
+    })),
+    lignes: lignes.map((l) => ({
+      id: l.id,
+      commande_id: l.commande_id,
+      owner_name: l.owner_name,
+      product_name: l.product_name,
+      net_amount: l.quantite * l.prix - Number(l.commission_amount || 0),
+      reason: l.payout_failure_reason,
+    })),
+  });
+}
+
+// Comme DashboardController::retryPayout côté web : remise à zéro puis nouveau virement.
+async function retryReservation(req, res) {
+  const [[reservation]] = await pool.query('SELECT * FROM reservations WHERE id = ?', [req.params.id]);
+  if (!reservation) return res.status(404).json({ message: 'Réservation introuvable' });
+
+  await pool.query(
+    'UPDATE reservations SET payout_transfer_id = NULL, payout_status = NULL, payout_failure_reason = NULL WHERE id = ?',
+    [reservation.id]
+  );
+  await triggerOwnerPayout({ ...reservation, payout_transfer_id: null });
+
+  const [[after]] = await pool.query('SELECT payout_status, payout_failure_reason FROM reservations WHERE id = ?', [reservation.id]);
+  if (after.payout_status === 'error') {
+    return res.status(422).json({ message: `Le virement a de nouveau échoué : ${after.payout_failure_reason || 'raison inconnue'}` });
+  }
+  res.json({ message: 'Virement relancé.', payout_status: after.payout_status });
+}
+
+/* Reversement des achats boutique, un virement par vendeur — miroir de
+   CommandeController::triggerOwnerPayouts côté web. */
+async function triggerCommandeOwnerPayouts(commandeId) {
+  const [lignes] = await pool.query(
+    `SELECT lc.id, lc.quantite, lc.prix, lc.commission_amount, p.user_id AS owner_id
+     FROM ligne_commandes lc JOIN products p ON lc.product_id = p.id
+     WHERE lc.commande_id = ? AND lc.payout_transfer_id IS NULL AND p.user_id IS NOT NULL`,
+    [commandeId]
+  );
+
+  const byOwner = {};
+  for (const l of lignes) (byOwner[l.owner_id] ||= []).push(l);
+
+  for (const [ownerId, ownerLignes] of Object.entries(byOwner)) {
+    const netAmount = ownerLignes.reduce((sum, l) => sum + l.quantite * l.prix - Number(l.commission_amount || 0), 0);
+    const result = await refundService.transferToUser(
+      Number(ownerId), netAmount, `PAYOUT-CMD-${commandeId}-${ownerId}`, `Reversement commande #${commandeId}`
+    );
+    if (result.status === null) continue; // pas de contact de paiement ou montant sous le minimum
+
+    await pool.query(
+      'UPDATE ligne_commandes SET payout_transfer_id = ?, payout_status = ?, payout_failure_reason = ? WHERE id IN (?)',
+      [result.transfer_id, result.status, result.failure_reason, ownerLignes.map((l) => l.id)]
+    );
+  }
+}
+
+// Comme CommandeController::retryLignePayout côté web : relance les lignes du même vendeur.
+async function retryLigne(req, res) {
+  const [[ligne]] = await pool.query(
+    `SELECT lc.id, lc.commande_id, p.user_id AS owner_id
+     FROM ligne_commandes lc LEFT JOIN products p ON lc.product_id = p.id WHERE lc.id = ?`,
+    [req.params.id]
+  );
+  if (!ligne) return res.status(404).json({ message: 'Ligne de commande introuvable' });
+
+  await pool.query(
+    `UPDATE ligne_commandes lc JOIN products p ON lc.product_id = p.id
+     SET lc.payout_transfer_id = NULL, lc.payout_status = NULL, lc.payout_failure_reason = NULL
+     WHERE lc.commande_id = ? AND p.user_id <=> ?`,
+    [ligne.commande_id, ligne.owner_id]
+  );
+  await triggerCommandeOwnerPayouts(ligne.commande_id);
+
+  const [[after]] = await pool.query('SELECT payout_status, payout_failure_reason FROM ligne_commandes WHERE id = ?', [ligne.id]);
+  if (after.payout_status === 'error') {
+    return res.status(422).json({ message: `Le virement a de nouveau échoué : ${after.payout_failure_reason || 'raison inconnue'}` });
+  }
+  res.json({ message: 'Virement relancé.', payout_status: after.payout_status });
+}
+
+module.exports = { adminList, recordPayout, failed, retryReservation, retryLigne };

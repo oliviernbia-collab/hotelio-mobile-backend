@@ -17,6 +17,7 @@ router.use('/boutique', require('./boutique'));
 router.use('/profile', require('./profile'));
 router.use('/dashboard', require('./dashboard'));
 router.use('/favorites', require('./favorites'));
+router.use('/reviews', require('./reviews'));
 router.use('/admin', require('./admin'));
 router.use('/services', require('./services'));
 router.use('/pointage', require('./pointage'));

@@ -12,12 +12,18 @@ async function authenticate(req, res, next) {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     const [rows] = await pool.query(
-      'SELECT id, name, email, role, status, hotels FROM users WHERE id = ?',
+      'SELECT id, name, email, role, status, hotels, tokens_valid_after FROM users WHERE id = ?',
       [decoded.id]
     );
     if (!rows.length) {
       return res.status(401).json({ message: 'Utilisateur introuvable' });
     }
+    // « Se déconnecter de tous les appareils » : les jetons émis avant cette date sont révoqués
+    // (iat est en secondes).
+    if (rows[0].tokens_valid_after && decoded.iat < Math.floor(new Date(rows[0].tokens_valid_after).getTime() / 1000)) {
+      return res.status(401).json({ message: 'Session expirée, reconnectez-vous.' });
+    }
+    delete rows[0].tokens_valid_after;
     if (rows[0].status !== 'actif') {
       return res.status(403).json({ message: 'Compte inactif' });
     }

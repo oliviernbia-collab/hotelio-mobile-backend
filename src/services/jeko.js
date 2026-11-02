@@ -16,6 +16,17 @@ function mapPaymentMethod(method) {
   return null;
 }
 
+// Jèko attend les numéros mobile money au format international (+225XXXXXXXXXX).
+// Un numéro ivoirien saisi localement (10 chiffres) reçoit l'indicatif +225.
+function toInternationalNumber(phone) {
+  const p = String(phone || '').replace(/[\s.\-()]/g, '');
+  if (p.startsWith('+')) return p;
+  if (p.startsWith('00')) return `+${p.slice(2)}`;
+  if (/^225\d{10}$/.test(p)) return `+${p}`;
+  if (/^\d{10}$/.test(p)) return `+225${p}`;
+  return p;
+}
+
 async function createPaymentRequest(data) {
   const res = await fetch(`${JEKO_BASE_URL}/partner_api/payment_requests`, {
     method: 'POST',
@@ -81,4 +92,4 @@ async function createTransfer(data) {
   return res.json();
 }
 
-module.exports = { mapPaymentMethod, createPaymentRequest, getPaymentRequest, createContact, deleteContact, createTransfer };
+module.exports = { mapPaymentMethod, toInternationalNumber, createPaymentRequest, getPaymentRequest, createContact, deleteContact, createTransfer };

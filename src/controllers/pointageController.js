@@ -1,4 +1,5 @@
 const { pool } = require('../config/database');
+const jwt = require('jsonwebtoken');
 
 function dstr(d) {
   if (!d) return null;
@@ -130,16 +131,7 @@ async function report(req, res) {
     hotelParams.push(req.user.id);
   }
 
-  let sql = `SELECT p.*, s.first_name, s.last_name, h.id as hotel_pk, h.name as hotel_name, h.short_name as hotel_short_name
-             FROM pointages p
-             JOIN staff s ON p.staff_id = s.id
-             JOIN hotels h ON p.hotel_id = h.id
-             WHERE p.date BETWEEN ? AND ?${hotelFilter}`;
-  const params = [fromDate, toDate, ...hotelParams];
-  if (hotel_id) { sql += ' AND p.hotel_id = ?'; params.push(hotel_id); }
-  if (staff_id) { sql += ' AND p.staff_id = ?'; params.push(staff_id); }
-  sql += ' ORDER BY p.date DESC';
-  const [pointages] = await pool.query(sql, params);
+  const pointages = await queryPointages(req.user, { hotel_id, staff_id, from: fromDate, to: toDate }, 'DESC');
 
   let schSql = `SELECT ss.*, s.first_name, s.last_name, h.name as hotel_name, h.short_name as hotel_short_name
                 FROM staff_schedules ss
@@ -170,4 +162,85 @@ async function report(req, res) {
   });
 }
 
-module.exports = { checkIn, checkOut, me, report };
+// Pointages visibles par l'utilisateur (admin : tous ; prestataire : ses hôtels), filtrés.
+async function queryPointages(user, { hotel_id, staff_id, from, to }, order) {
+  let sql = `SELECT p.*, s.first_name, s.last_name, h.id as hotel_pk, h.name as hotel_name, h.short_name as hotel_short_name
+             FROM pointages p
+             JOIN staff s ON p.staff_id = s.id
+             JOIN hotels h ON p.hotel_id = h.id
+             WHERE p.date BETWEEN ? AND ?`;
+  const params = [from, to];
+  if (user.role === 'prestataire') { sql += ' AND h.user_id = ?'; params.push(user.id); }
+  if (hotel_id) { sql += ' AND p.hotel_id = ?'; params.push(hotel_id); }
+  if (staff_id) { sql += ' AND p.staff_id = ?'; params.push(staff_id); }
+  sql += ` ORDER BY p.date ${order === 'ASC' ? 'ASC' : 'DESC'}`;
+  const [rows] = await pool.query(sql, params);
+  return rows;
+}
+
+/* Export CSV (Excel) — miroir de PointageController::export côté web. L'app obtient un jeton
+   de 2 minutes puis ouvre le lien dans le navigateur, qui ne peut pas envoyer l'en-tête
+   Authorization (même mécanisme que les reçus PDF). */
+async function exportToken(req, res) {
+  if (!['admin', 'prestataire'].includes(req.user.role)) {
+    return res.status(403).json({ message: 'Accès réservé aux propriétaires.' });
+  }
+  const { hotel_id, staff_id, from, to } = req.query;
+  const token = jwt.sign(
+    { purpose: 'pointage-export', userId: req.user.id, filters: { hotel_id, staff_id, from, to } },
+    process.env.JWT_SECRET,
+    { algorithm: 'HS256', expiresIn: '2m' }
+  );
+  res.json({ token });
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+// Heures stockées en heure locale ; la connexion MySQL lit en UTC, d'où les getters UTC.
+const hhmm = (d) => (d ? `${pad2(new Date(d).getUTCHours())}:${pad2(new Date(d).getUTCMinutes())}` : '');
+const csvCell = (v) => {
+  const s = String(v ?? '');
+  return /[",;\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+async function exportCsv(req, res) {
+  let decoded;
+  try {
+    decoded = jwt.verify(String(req.query.token || ''), process.env.JWT_SECRET, { algorithms: ['HS256'] });
+  } catch {
+    return res.status(401).send('Lien de téléchargement invalide ou expiré.');
+  }
+  if (decoded.purpose !== 'pointage-export') return res.status(401).send('Lien de téléchargement invalide.');
+
+  const [[user]] = await pool.query('SELECT id, role FROM users WHERE id = ?', [decoded.userId]);
+  if (!user || !['admin', 'prestataire'].includes(user.role)) return res.status(403).send('Accès refusé.');
+
+  const f = decoded.filters || {};
+  const from = f.from || firstOfMonthStr();
+  const to = f.to || todayStr();
+  const rows = (await queryPointages(user, { ...f, from, to }, 'ASC')).map(withComputed);
+
+  const lines = [['Employé', 'Hôtel', 'Date', 'Arrivée', 'Départ', 'Retard (min)', 'Heures travaillées', 'Statut']];
+  for (const p of rows) {
+    const [y, m, d] = dstr(p.date).split('-');
+    const worked = p.worked_minutes !== null ? `${pad2(Math.floor(p.worked_minutes / 60))}:${pad2(p.worked_minutes % 60)}` : '';
+    lines.push([
+      `${p.first_name} ${p.last_name}`,
+      p.hotel_name || '',
+      `${d}/${m}/${y}`,
+      hhmm(p.check_in),
+      hhmm(p.check_out),
+      p.late_minutes ?? 0,
+      worked,
+      p.status.charAt(0).toUpperCase() + p.status.slice(1),
+    ]);
+  }
+
+  const csv = '﻿' + lines.map((l) => l.map(csvCell).join(',')).join('\r\n') + '\r\n'; // BOM pour Excel
+  res.set({
+    'Content-Type': 'text/csv; charset=UTF-8',
+    'Content-Disposition': `attachment; filename="pointages_${from.replace(/-/g, '')}_${to.replace(/-/g, '')}.csv"`,
+  });
+  res.send(csv);
+}
+
+module.exports = { checkIn, checkOut, me, report, exportToken, exportCsv };

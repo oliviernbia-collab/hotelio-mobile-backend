@@ -1,6 +1,6 @@
 const { pool } = require('../config/database');
-const { v4: uuidv4 } = require('uuid');
 const jeko = require('./jeko');
+const { notifyUser: notifyWithEmail } = require('./notify');
 
 /**
  * Annulation avec remboursement réel d'une réservation ou d'une commande boutique déjà
@@ -66,19 +66,6 @@ async function hasPayoutContact(userId) {
   return !!(user && user.jeko_contact_id);
 }
 
-async function notifyUser(userId, type, title, message, extra = {}) {
-  try {
-    const notifId = uuidv4();
-    await pool.query(
-      `INSERT INTO notifications (id, type, notifiable_type, notifiable_id, data, created_at, updated_at)
-       VALUES (?, ?, 'App\\\\Models\\\\User', ?, ?, NOW(), NOW())`,
-      [notifId, type, userId, JSON.stringify({ title, message, icon: 'fa-calendar-xmark', color: '#e63946', ...extra })]
-    );
-  } catch (e) {
-    console.error('Notification error:', e);
-  }
-}
-
 /** Annule les effets comptables de markReservationPaid() : commission remise à zéro, stats décrémentées. */
 async function reverseReservationCommissionAndStats(reservation) {
   await pool.query(
@@ -108,7 +95,23 @@ function canCancelReservation(reservation) {
  * `reservation` doit contenir : id, code, total, status, checkin, checkin_at, paid,
  * jeko_reference, hotel_id, client_id, payout_transfer_id.
  */
-async function cancelReservation(reservation) {
+// byHotel : annulation décidée par l'hôtel ou un admin → remboursement intégral (100 %), sans
+// frais ni indemnité prestataire, et sans délai minimum avant l'arrivée.
+async function cancelReservation(reservation, { byHotel = false } = {}) {
+  const result = await cancelReservationAndRefund(reservation, byHotel);
+
+  // Chambre libérée dès que l'annulation aboutit (elle restait « réservée »), sauf si le client
+  // est déjà dans la chambre — même règle que RefundService::cancelReservation côté web.
+  if (result.ok) {
+    await pool.query(
+      "UPDATE rooms SET status = 'disponible', updated_at = NOW() WHERE hotel_id = ? AND number = ? AND status = 'réservée'",
+      [reservation.hotel_id, reservation.room]
+    );
+  }
+  return result;
+}
+
+async function cancelReservationAndRefund(reservation, byHotel) {
   if (!reservation.paid) {
     if (reservation.checkin_at) {
       return { ok: false, error: 'too_late', message: 'Cette réservation ne peut plus être annulée (séjour déjà commencé).' };
@@ -117,7 +120,10 @@ async function cancelReservation(reservation) {
     return { ok: true, error: null, message: 'Réservation annulée.' };
   }
 
-  if (!canCancelReservation(reservation)) {
+  if (reservation.checkin_at) {
+    return { ok: false, error: 'too_late', message: 'Cette réservation ne peut plus être annulée (séjour déjà commencé).' };
+  }
+  if (!byHotel && !canCancelReservation(reservation)) {
     return { ok: false, error: 'too_late', message: 'Cette réservation ne peut plus être annulée (séjour commencé ou trop proche).' };
   }
 
@@ -138,11 +144,15 @@ async function cancelReservation(reservation) {
     return {
       ok: false,
       error: 'missing_payout_contact',
-      message: "Enregistrez d'abord vos coordonnées de paiement (mobile money ou compte bancaire) pour recevoir votre remboursement.",
+      message: byHotel
+        ? "Le client n'a pas encore enregistré ses coordonnées de paiement : le remboursement est impossible pour l'instant. Demandez-lui de les ajouter dans son profil, puis réessayez."
+        : "Enregistrez d'abord vos coordonnées de paiement (mobile money ou compte bancaire) pour recevoir votre remboursement.",
     };
   }
 
-  const { fee, adminAmount, providerAmount, refundAmount } = splitAmounts(Number(reservation.total));
+  const { fee, adminAmount, providerAmount, refundAmount } = byHotel
+    ? { fee: 0, adminAmount: 0, providerAmount: 0, refundAmount: Number(reservation.total) }
+    : splitAmounts(Number(reservation.total));
 
   const refundResult = await transferToUser(
     clientUserId,
@@ -161,7 +171,7 @@ async function cancelReservation(reservation) {
       payout_transfer_id: reservation.payout_transfer_id,
       provider_share_due: providerAmount,
     });
-  } else if (hotel && hotel.user_id) {
+  } else if (hotel && hotel.user_id && providerAmount > 0) {
     const ownerResult = await transferToUser(
       hotel.user_id,
       providerAmount,
@@ -188,13 +198,17 @@ async function cancelReservation(reservation) {
     [fee, adminAmount, refundAmount, refundResult.transfer_id, refundResult.status, refundResult.failure_reason, reservation.id]
   );
 
+  // ReservationCancelledNotification côté web : notification + e-mail
   if (clientUserId) {
-    await notifyUser(
+    await notifyWithEmail(
       clientUserId,
       'reservation_cancelled',
-      '❌ Réservation annulée',
-      `Réservation ${reservation.code} annulée. Frais retenus : ${fee.toLocaleString()} FCFA (5%). Remboursé : ${refundAmount.toLocaleString()} FCFA.`,
-      { amount: refundAmount }
+      'Réservation annulée',
+      byHotel
+        ? `La réservation ${reservation.code} a été annulée par l'hôtel. Remboursement intégral de ${refundAmount.toLocaleString('fr-FR')} FCFA initié.`
+        : `La réservation ${reservation.code} a été annulée. Frais retenus : ${fee.toLocaleString('fr-FR')} FCFA (5 %). Remboursement de ${refundAmount.toLocaleString('fr-FR')} FCFA initié.`,
+      { icon: 'fa-calendar-xmark', color: '#e63946', amount: refundAmount },
+      { withEmail: true }
     );
   }
 
@@ -230,6 +244,18 @@ async function cancelCommande(commande) {
 
   if (!canCancelCommande(commande)) {
     return { ok: false, error: 'too_late', message: "Le délai d'annulation (48h après l'achat) est dépassé." };
+  }
+
+  if (!commande.jeko_reference) {
+    // Payée en espèces/virement : l'argent n'est jamais passé par Jèko, impossible et
+    // incorrect d'y puiser un remboursement — reste géré manuellement par le vendeur.
+    const [lignes] = await pool.query('SELECT quantite, product_id FROM ligne_commandes WHERE commande_id = ?', [commande.id]);
+    for (const ligne of lignes) {
+      await pool.query('UPDATE products SET stock = stock + ? WHERE id = ?', [ligne.quantite, ligne.product_id]);
+    }
+    await pool.query('UPDATE ligne_commandes SET commission_rate = NULL, commission_amount = NULL WHERE commande_id = ?', [commande.id]);
+    await pool.query("UPDATE commandes SET statut = 'annulée', cancelled_at = NOW(), updated_at = NOW() WHERE id = ?", [commande.id]);
+    return { ok: true, error: null, message: 'Commande annulée, articles remis en stock. Remboursement à gérer directement avec le client (paiement espèces/virement).' };
   }
 
   if (!(await hasPayoutContact(commande.user_id))) {

@@ -2,6 +2,10 @@ const { pool } = require('../config/database');
 const { v4: uuidv4 } = require('uuid');
 const jeko = require('../services/jeko');
 const refundService = require('../services/refundService');
+const { notifyUser: notifyClient } = require('../services/notify');
+const mailer = require('../services/mailer');
+const { buildReservationReceipt } = require('../services/receipts');
+const jwt = require('jsonwebtoken');
 const { canManageHotel } = require('../utils/authorize');
 
 /* Notification in-app (lue aussi bien par le web que par le mobile, même table `notifications`) */
@@ -42,7 +46,15 @@ async function computeCommission(reservation) {
   return { rate, amount };
 }
 
+// Idempotent : le passage paid 0 → 1 est atomique, donc un second appel (webhook web,
+// page-relais et vérification depuis l'app peuvent se croiser) ne recompte pas les stats.
 async function markReservationPaid(reservation) {
+  const [flip] = await pool.query(
+    "UPDATE reservations SET paid = 1, status = 'confirmée', updated_at = NOW() WHERE id = ? AND paid = 0",
+    [reservation.id]
+  );
+  if (!flip.affectedRows) return false;
+
   const commission = await computeCommission(reservation);
   if (commission) {
     await pool.query(
@@ -51,10 +63,6 @@ async function markReservationPaid(reservation) {
     );
   }
 
-  await pool.query(
-    "UPDATE reservations SET paid = 1, status = 'confirmée', updated_at = NOW() WHERE id = ?",
-    [reservation.id]
-  );
   await pool.query(
     `UPDATE clients SET
        total_spend = total_spend + ?,
@@ -68,6 +76,59 @@ async function markReservationPaid(reservation) {
     'UPDATE hotels SET revenue = revenue + ?, checkins = checkins + 1 WHERE id = ?',
     [reservation.total, reservation.hotel_id]
   );
+
+  const [[info]] = await pool.query(
+    `SELECT res.*, c.user_id, c.first_name, c.last_name, COALESCE(u.email, c.email) AS recipient_email,
+            h.name AS hotel_name, h.city AS hotel_city
+     FROM reservations res
+     JOIN clients c ON res.client_id = c.id
+     JOIN hotels h ON res.hotel_id = h.id
+     LEFT JOIN users u ON c.user_id = u.id
+     WHERE res.id = ?`,
+    [reservation.id]
+  );
+
+  // E-mail de confirmation avec facture PDF (comme ReservationConfirmed côté web).
+  // Un échec SMTP ne doit pas annuler la confirmation du paiement.
+  if (info && info.recipient_email) {
+    try {
+      await mailer.sendReservationConfirmed(info.recipient_email, info);
+    } catch (e) {
+      console.error('⚠️  E-mail de confirmation non envoyé:', e.message);
+    }
+  }
+
+  // Notification in-app au client (même contenu que ReservationConfirmedNotification côté web)
+  if (info && info.user_id) {
+    await notifyUser(
+      info.user_id,
+      'reservation_confirmed',
+      'Paiement confirmé',
+      `Votre réservation ${reservation.code} à ${info.hotel_name} est confirmée.`,
+      { icon: 'fa-circle-check', amount: reservation.total }
+    );
+  }
+  return true;
+}
+
+/* Interroge directement Jèko sur la demande de paiement d'une réservation et la confirme si
+   elle a abouti. Ne dépend ni du webhook ni du backend web : c'est ce qui permet à l'app de
+   voir son paiement confirmé même quand le webhook n'arrive pas (dev local, serveur web arrêté). */
+async function syncJekoReservation(reservation) {
+  if (reservation.paid) return 'success';
+  if (!reservation.jeko_payment_request_id) return null;
+
+  const result = await jeko.getPaymentRequest(reservation.jeko_payment_request_id);
+  const status = result && result.status;
+  if (status === 'success') {
+    await markReservationPaid(reservation);
+  } else if (status === 'error') {
+    await pool.query(
+      "UPDATE reservations SET status = 'paiement_échoué', updated_at = NOW() WHERE id = ? AND paid = 0",
+      [reservation.id]
+    );
+  }
+  return status || null;
 }
 
 async function index(req, res) {
@@ -111,6 +172,7 @@ async function show(req, res) {
     `SELECT res.*,
             c.first_name, c.last_name, c.email AS client_email, c.phone AS client_phone, c.user_id AS client_user_id,
             h.name AS hotel_name, h.short_name AS hotel_short_name, h.city AS hotel_city, h.stars AS hotel_stars,
+            h.quartier AS hotel_quartier, h.latitude AS hotel_latitude, h.longitude AS hotel_longitude, h.phone AS hotel_phone,
             r.number AS room_number, r.type AS room_type, r.price AS room_price
      FROM reservations res
      JOIN clients c  ON res.client_id = c.id
@@ -132,6 +194,23 @@ async function store(req, res) {
   if (!hotel_id || !checkin || !checkout) {
     return res.status(422).json({ message: 'hotel_id, checkin et checkout requis' });
   }
+
+  // Mêmes règles que DashboardController::storeReservation côté web : arrivée au plus tôt
+  // aujourd'hui, départ après l'arrivée. Le nombre de nuits est toujours recalculé ici (jamais
+  // repris de la requête), sinon le montant facturé pourrait être manipulé.
+  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+  if (!DATE_RE.test(String(checkin)) || !DATE_RE.test(String(checkout))) {
+    return res.status(422).json({ message: 'Dates invalides (format AAAA-MM-JJ attendu).' });
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  if (checkin < today) {
+    return res.status(422).json({ message: "La date d'arrivée ne peut pas être dans le passé." });
+  }
+  if (checkout <= checkin) {
+    return res.status(422).json({ message: "La date de départ doit être après la date d'arrivée." });
+  }
+  nights = Math.max(1, Math.round((Date.parse(checkout) - Date.parse(checkin)) / 86400000));
+  nationality = nationality || "Côte d'Ivoire";
 
   // Résolution automatique du client depuis l'utilisateur connecté
   if (!client_id && req.user) {
@@ -158,12 +237,6 @@ async function store(req, res) {
 
   if (!client_id) {
     return res.status(422).json({ message: 'client_id requis' });
-  }
-
-  // Calcul automatique des nuits si non fourni
-  if (!nights) {
-    const ms = new Date(checkout).getTime() - new Date(checkin).getTime();
-    nights = Math.max(1, Math.round(ms / 86400000));
   }
 
   // Chambre et prix proviennent toujours de la base, jamais du client (évite toute manipulation
@@ -303,7 +376,8 @@ async function triggerOwnerPayout(reservation) {
 
 async function updateStatus(req, res) {
   const { status } = req.body;
-  const valid = ['confirmée', 'en_attente', 'annulée', 'complétée'];
+  // Mêmes statuts que le web (DashboardController::updateReservationStatus)
+  const valid = ['confirmée', 'en_attente', 'annulée', 'arrivée', 'départie'];
   if (!valid.includes(status)) return res.status(422).json({ message: 'Statut invalide' });
 
   const [rows] = await pool.query(
@@ -320,9 +394,34 @@ async function updateStatus(req, res) {
   }
 
   if (status === 'annulée' && reservation.status !== 'annulée') {
-    const result = await refundService.cancelReservation(reservation);
+    // Paiement Jèko pas encore confirmé : on vérifie d'abord, sinon une réservation réellement
+    // payée serait annulée comme impayée, donc sans remboursement.
+    if (!reservation.paid && reservation.jeko_payment_request_id) {
+      try {
+        if ((await syncJekoReservation(reservation)) === 'success') {
+          const [[fresh]] = await pool.query('SELECT * FROM reservations WHERE id = ?', [reservation.id]);
+          Object.assign(reservation, fresh);
+        }
+      } catch (e) {
+        return res.status(502).json({ message: 'Impossible de vérifier le paiement auprès de Jèko. Réessayez dans un instant.' });
+      }
+    }
+    const result = await refundService.cancelReservation(reservation, { byHotel: req.user.role !== 'client' });
     if (!result.ok) {
       return res.status(422).json({ error: result.error, message: result.message });
+    }
+    // Annulation par l'hôtel ou un admin : le client est prévenu (app + e-mail), comme
+    // updateReservationStatus côté web. Le remboursement Jèko notifie déjà de son côté.
+    if (req.user.role !== 'client' && result.refundAmount == null && reservation.client_user_id) {
+      const [[hotel]] = await pool.query('SELECT name, short_name FROM hotels WHERE id = ?', [reservation.hotel_id]);
+      await notifyClient(
+        reservation.client_user_id,
+        'reservation_cancelled',
+        'Réservation annulée',
+        `La réservation ${reservation.code} pour ${hotel?.short_name || hotel?.name || "l'hôtel"} a été annulée.`,
+        { icon: 'fa-calendar-xmark', color: '#e63946' },
+        { withEmail: true }
+      );
     }
     return res.json({ message: result.message, status: 'annulée', refund: { fee: result.fee, amount: result.refundAmount, status: result.refundStatus } });
   }
@@ -337,11 +436,13 @@ async function checkin(req, res) {
   if (!(await canManageHotel(req.user, rows[0].hotel_id))) {
     return res.status(403).json({ message: 'Accès refusé à cette réservation.' });
   }
-  await pool.query("UPDATE reservations SET checkin_at = NOW(), status = 'confirmée', updated_at = NOW() WHERE id = ?", [req.params.id]);
-  if (rows[0].room_id) {
-    await pool.query("UPDATE rooms SET status = 'occupée', updated_at = NOW() WHERE id = ?", [rows[0].room_id]);
+  if (rows[0].checkin_at) {
+    return res.status(422).json({ message: 'Le check-in a déjà été effectué.' });
   }
-  await pool.query("UPDATE hotels SET checkins = checkins + 1 WHERE id = ?", [rows[0].hotel_id]);
+  // Même statut que le web (DashboardController::checkIn) : la base est partagée. Le compteur
+  // de check-ins de l'hôtel n'est pas touché ici : il est incrémenté au paiement.
+  await pool.query("UPDATE reservations SET checkin_at = NOW(), status = 'arrivée', updated_at = NOW() WHERE id = ?", [req.params.id]);
+  await setRoomStatus(rows[0], 'occupée');
 
   // Le séjour commence : plus de risque d'annulation, on peut reverser le prestataire.
   if (rows[0].paid) {
@@ -358,14 +459,35 @@ async function checkout(req, res) {
   if (!(await canManageHotel(req.user, rows[0].hotel_id))) {
     return res.status(403).json({ message: 'Accès refusé à cette réservation.' });
   }
-  await pool.query("UPDATE reservations SET checkout_at = NOW(), status = 'complétée', updated_at = NOW() WHERE id = ?", [req.params.id]);
-  if (rows[0].room_id) {
-    await pool.query("UPDATE rooms SET status = 'en_nettoyage', updated_at = NOW() WHERE id = ?", [rows[0].room_id]);
+  if (rows[0].checkout_at) {
+    return res.status(422).json({ message: 'Le check-out a déjà été effectué.' });
   }
-  await pool.query("UPDATE hotels SET checkouts = checkouts + 1, revenue = revenue + ? WHERE id = ?", [rows[0].total, rows[0].hotel_id]);
-  // Mise à jour de la date de dernière visite seulement (total_spend déjà comptabilisé à la création)
-  await pool.query("UPDATE clients SET last_visit = CURDATE(), updated_at = NOW() WHERE id = ?", [rows[0].client_id]);
-  res.json({ message: 'Check-out enregistré' });
+  if (!rows[0].checkin_at) {
+    return res.status(422).json({ message: "Le check-in n'a pas encore été effectué." });
+  }
+  // Même statut que le web (DashboardController::checkOut). Le chiffre d'affaires de l'hôtel et
+  // les dépenses/séjours du client sont déjà comptés au paiement (markReservationPaid) : on ne
+  // les recompte pas ici.
+  await pool.query("UPDATE reservations SET checkout_at = NOW(), status = 'départie', updated_at = NOW() WHERE id = ?", [req.params.id]);
+  await setRoomStatus(rows[0], 'en_nettoyage');
+  await pool.query('UPDATE hotels SET checkouts = checkouts + 1 WHERE id = ?', [rows[0].hotel_id]);
+  // Fidélité, comme le web : 10 points par nuit, crédités au départ
+  await pool.query(
+    'UPDATE clients SET points_fidelite = points_fidelite + ?, last_visit = CURDATE(), updated_at = NOW() WHERE id = ?',
+    [Number(rows[0].nights || 0) * LOYALTY_POINTS_PER_NIGHT, rows[0].client_id]
+  );
+  res.json({ message: 'Check-out enregistré. Points fidélité crédités.' });
+}
+
+const LOYALTY_POINTS_PER_NIGHT = 10;
+
+// Chambre de la réservation : par id si connu, sinon par numéro (réservations créées sur le web).
+async function setRoomStatus(reservation, status) {
+  if (reservation.room_id) {
+    await pool.query('UPDATE rooms SET status = ?, updated_at = NOW() WHERE id = ?', [status, reservation.room_id]);
+  } else if (reservation.room) {
+    await pool.query('UPDATE rooms SET status = ?, updated_at = NOW() WHERE hotel_id = ? AND number = ?', [status, reservation.hotel_id, reservation.room]);
+  }
 }
 
 async function processPayment(req, res) {
@@ -431,4 +553,76 @@ async function processPayment(req, res) {
   res.json({ message: 'Redirection vers Jèko', paid: false, redirectUrl: result.redirectUrl, reference });
 }
 
-module.exports = { index, mine, show, store, updateStatus, checkin, checkout, processPayment };
+// Appelé par l'app au retour du navigateur de paiement : vérifie auprès de Jèko et confirme.
+async function verifyPayment(req, res) {
+  const [rows] = await pool.query(`SELECT res.*, c.user_id AS client_user_id FROM reservations res JOIN clients c ON res.client_id = c.id WHERE res.id = ?`, [req.params.id]);
+  if (!rows.length) return res.status(404).json({ message: 'Réservation introuvable' });
+  const reservation = rows[0];
+
+  if (!(await canAccessReservation(req.user, reservation))) {
+    return res.status(403).json({ message: 'Accès refusé à cette réservation.' });
+  }
+
+  let status;
+  try {
+    status = await syncJekoReservation(reservation);
+  } catch (e) {
+    return res.status(502).json({ message: 'Impossible de contacter Jèko pour le moment.' });
+  }
+  res.json({ paid: status === 'success', status });
+}
+
+/* Reçu PDF : l'app obtient un jeton de 2 minutes (requête authentifiée), puis ouvre le lien
+   de téléchargement dans le navigateur, qui ne peut pas envoyer l'en-tête Authorization
+   (même mécanisme que le téléchargement des factures). */
+async function receiptToken(req, res) {
+  const [rows] = await pool.query(`SELECT res.*, c.user_id AS client_user_id FROM reservations res JOIN clients c ON res.client_id = c.id WHERE res.id = ?`, [req.params.id]);
+  if (!rows.length) return res.status(404).json({ message: 'Réservation introuvable' });
+  const reservation = rows[0];
+
+  if (!(await canAccessReservation(req.user, reservation))) {
+    return res.status(403).json({ message: 'Accès refusé à cette réservation.' });
+  }
+  if (!reservation.paid) {
+    return res.status(422).json({ message: 'Le reçu est disponible une fois la réservation payée.' });
+  }
+
+  const token = jwt.sign(
+    { purpose: 'reservation-receipt', reservationId: reservation.id },
+    process.env.JWT_SECRET,
+    { algorithm: 'HS256', expiresIn: '2m' }
+  );
+  res.json({ token });
+}
+
+async function receipt(req, res) {
+  let decoded;
+  try {
+    decoded = jwt.verify(String(req.query.token || ''), process.env.JWT_SECRET, { algorithms: ['HS256'] });
+  } catch {
+    return res.status(401).send('Lien de téléchargement invalide ou expiré.');
+  }
+  if (decoded.purpose !== 'reservation-receipt' || Number(decoded.reservationId) !== Number(req.params.id)) {
+    return res.status(401).send('Lien de téléchargement invalide.');
+  }
+
+  const [[r]] = await pool.query(
+    `SELECT res.*, c.first_name, c.last_name, h.name AS hotel_name, h.city AS hotel_city
+     FROM reservations res
+     JOIN clients c ON res.client_id = c.id
+     JOIN hotels h ON res.hotel_id = h.id
+     WHERE res.id = ? AND res.paid = 1`,
+    [req.params.id]
+  );
+  if (!r) return res.status(404).send('Reçu introuvable.');
+
+  const pdf = await buildReservationReceipt(r);
+  res.set({
+    'Content-Type': 'application/pdf',
+    'Content-Disposition': `attachment; filename="recu_${r.code}.pdf"`,
+    'Content-Length': pdf.length,
+  });
+  res.send(pdf);
+}
+
+module.exports = { index, mine, show, store, updateStatus, checkin, checkout, processPayment, verifyPayment, syncJekoReservation, receiptToken, receipt, triggerOwnerPayout };

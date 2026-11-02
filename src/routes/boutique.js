@@ -39,5 +39,7 @@ router.post('/order',            authenticate, ctrl.placeOrder);
 router.get('/my-orders',           authenticate, ctrl.myOrders);
 router.get('/orders/:id/items',    authenticate, ctrl.getOrderItems);
 router.patch('/orders/:id/cancel', authenticate, ctrl.cancelOrder);
+router.get('/orders/:id/receipt-token', authenticate, ctrl.receiptToken);
+router.get('/orders/:id/receipt', ctrl.receipt); // authentifié par le jeton de téléchargement
 
 module.exports = router;

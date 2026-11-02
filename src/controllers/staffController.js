@@ -159,6 +159,9 @@ async function getSchedules(req, res) {
   if (hotel_id) { sql += ' AND ss.hotel_id = ?'; params.push(hotel_id); }
   if (staff_id) { sql += ' AND ss.staff_id = ?'; params.push(staff_id); }
   if (date) { sql += ' AND ss.date = ?'; params.push(date); }
+  // Plage de dates (semaine affichée par l'écran planning, comme la page web)
+  if (req.query.from) { sql += ' AND ss.date >= ?'; params.push(req.query.from); }
+  if (req.query.to)   { sql += ' AND ss.date <= ?'; params.push(req.query.to); }
   sql += ' ORDER BY ss.date DESC, s.last_name';
   const [rows] = await pool.query(sql, params);
   res.json(rows);
@@ -176,12 +179,38 @@ async function createSchedule(req, res) {
   if (!staffRows.length || Number(staffRows[0].hotel_id) !== Number(hotel_id)) {
     return res.status(422).json({ message: "Cet employé n'appartient pas à cet hôtel." });
   }
-  const [result] = await pool.query(
-    'INSERT INTO staff_schedules (staff_id, hotel_id, date, shift, start_time, end_time, poste, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [staff_id, hotel_id, date, shift, start_time, end_time, poste, notes]
-  );
-  const [newSched] = await pool.query('SELECT * FROM staff_schedules WHERE id = ?', [result.insertId]);
-  res.status(201).json(newSched[0]);
+
+  // Mêmes règles que DashboardController::storeSchedule côté web
+  const SHIFTS = ['matin', 'apres_midi', 'nuit', 'repos'];
+  const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+  if (!SHIFTS.includes(shift)) return res.status(422).json({ message: 'Créneau invalide.' });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date))) return res.status(422).json({ message: 'Date invalide.' });
+  if ((start_time && !TIME_RE.test(start_time)) || (end_time && !TIME_RE.test(end_time))) {
+    return res.status(422).json({ message: 'Heure invalide (format HH:MM attendu).' });
+  }
+  if ((poste && String(poste).length > 100) || (notes && String(notes).length > 500)) {
+    return res.status(422).json({ message: 'Poste (100 car.) ou notes (500 car.) trop longs.' });
+  }
+
+  // Un seul planning par employé et par jour : on remplace l'existant (updateOrCreate du web)
+  const values = [hotel_id, shift, start_time || null, end_time || null, poste || null, notes || null];
+  const [existing] = await pool.query('SELECT id FROM staff_schedules WHERE staff_id = ? AND date = ? LIMIT 1', [staff_id, date]);
+  let id;
+  if (existing.length) {
+    id = existing[0].id;
+    await pool.query(
+      'UPDATE staff_schedules SET hotel_id = ?, shift = ?, start_time = ?, end_time = ?, poste = ?, notes = ?, updated_at = NOW() WHERE id = ?',
+      [...values, id]
+    );
+  } else {
+    const [result] = await pool.query(
+      'INSERT INTO staff_schedules (staff_id, date, hotel_id, shift, start_time, end_time, poste, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())',
+      [staff_id, date, ...values]
+    );
+    id = result.insertId;
+  }
+  const [saved] = await pool.query('SELECT * FROM staff_schedules WHERE id = ?', [id]);
+  res.status(existing.length ? 200 : 201).json(saved[0]);
 }
 
 module.exports = { me, index, show, store, update, destroy, getSchedules, createSchedule };

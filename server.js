@@ -4,6 +4,7 @@ const express = require('express');
 require('express-async-errors'); // patche express pour transmettre les rejets de promesses à errorHandler au lieu de planter le process
 const cors = require('cors');
 const { testConnection } = require('./src/config/database');
+const { syncByReference } = require('./src/services/jekoSync');
 const routes = require('./src/routes/index');
 const errorHandler = require('./src/middleware/errorHandler');
 
@@ -55,29 +56,18 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'Hôtelio
 // navigateur système après son paiement. La confirmation définitive vient normalement
 // du webhook Jèko (voir JekoWebhookController@handle côté web) — mais celui-ci ne peut
 // pas nous joindre si ce serveur n'est pas accessible publiquement (ex. développement
-// local). En filet de sécurité, on demande donc ici au backend web de revérifier
-// directement auprès de Jèko et de confirmer le paiement si le webhook n'est pas
-// encore arrivé (voir JekoWebhookController::syncPayment).
-const WEBPHP_URL = process.env.WEBPHP_URL || 'http://localhost:8000';
-
+// local). En filet de sécurité, on interroge donc ici Jèko directement et on confirme
+// le paiement (réservation, commande ou abonnement) si le webhook n'est pas encore arrivé.
 app.get('/payment/bridge', async (req, res) => {
   const ok = req.query.result !== 'error';
   let synced = null;
 
-  if (ok && req.query.ref && process.env.JEKO_INTERNAL_SYNC_KEY) {
+  if (ok && req.query.ref) {
     try {
-      const syncRes = await fetch(`${WEBPHP_URL}/api/internal/jeko/sync-payment`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Internal-Key': process.env.JEKO_INTERNAL_SYNC_KEY,
-        },
-        body: JSON.stringify({ reference: req.query.ref }),
-      });
-      const data = await syncRes.json();
-      synced = !!data.synced;
+      const status = await syncByReference(String(req.query.ref));
+      if (status !== null) synced = status === 'success';
     } catch (e) {
-      console.error('⚠️  /payment/bridge : échec de la vérification de secours auprès de Jèko:', e.message);
+      console.error('⚠️  /payment/bridge : échec de la vérification auprès de Jèko:', e.message);
     }
   }
 
